@@ -14,9 +14,16 @@ func main() {
 	})
 	defer connObj.CloseConnection()
 
-	q := connObj.DeclareQueue("hello", false)
+	q := connObj.QueueDeclare(utils.QueueOptions{
+		Name:       "hello",
+		Durability: false,
+		AutoDelete: false,
+		Exclusive:  false,
+		NoWait:     false,
+		Args:       nil,
+	})
 
-	msgs := connObj.ConsumeFromQueue(q.Name, true)
+	msgs := connObj.Consume(q.Name, true)
 
 	forever := make(chan struct{})
 

@@ -15,10 +15,23 @@ func main() {
 	})
 	defer connObj.CloseConnection()
 
-	q := connObj.DeclareQueue("hello", false)
+	q := connObj.QueueDeclare(utils.QueueOptions{
+		Name:       "hello",
+		Durability: false,
+		AutoDelete: false,
+		Exclusive:  false,
+		NoWait:     false,
+		Args:       nil,
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	connObj.PublishOnQueue(ctx, q.Name, "Hello, World!", "", false)
+	connObj.PublishWithContext(ctx, "Hello World!", utils.PublishOptions{
+		ExchangeName:   "",
+		RoutingKey:     q.Name,
+		Mandatory:      false,
+		Immediate:      false,
+		MsgPersistency: false,
+	})
 }

@@ -30,9 +30,16 @@ func main() {
 	err := ch.Qos(1, 0, false)
 	utils.FailOnError(err, "failed to set QoS")
 
-	q := connObj.DeclareQueue("task_queue", true)
+	q := connObj.QueueDeclare(utils.QueueOptions{
+		Name:       "task_queue",
+		Durability: true,
+		AutoDelete: false,
+		Exclusive:  false,
+		NoWait:     false,
+		Args:       nil,
+	})
 
-	msgs := connObj.ConsumeFromQueue(q.Name, false)
+	msgs := connObj.Consume(q.Name, false)
 
 	forever := make(chan struct{})
 
