@@ -18,7 +18,6 @@ type Credentials struct {
 type RabbitMQConn struct {
 	conn    *amqp091.Connection
 	channel *amqp091.Channel
-	queue   amqp091.Queue
 }
 
 func NewRMQConn(c Credentials) RabbitMQConn {
@@ -77,8 +76,7 @@ func (rm *RabbitMQConn) QueueDeclare(opts QueueOptions) amqp091.Queue {
 	)
 	FailOnError(err, "failed to declare a queue")
 
-	rm.queue = q
-	return rm.queue
+	return q
 }
 
 type PublishOptions struct {
