@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package telemetry.v1;
+
+option go_package = "github.com/hardik-choksi/experiments/go/grpc-demo/gen/telemetry/v1";
+
+// ── Messages ──────────────────────────────────────────────────────────────────
+
+// A single span, like what your OTel SDK produces
+message Span {
+  string trace_id    = 1; // field number, NOT the value. baked into binary encoding.
+  string span_id     = 2;
+  string name        = 3;
+  string service     = 4;
+  int64  start_time  = 5; // unix nanoseconds
+  int64  end_time    = 6;
+  SpanStatus status  = 7;
+  repeated KeyValue attributes = 8; // repeated = slice in Go
+}
+
+enum SpanStatus {
+  SPAN_STATUS_UNSPECIFIED = 0; // proto3 enums MUST start at 0
+  SPAN_STATUS_OK          = 1;
+  SPAN_STATUS_ERROR       = 2;
+}
+
+message KeyValue {
+  string key   = 1;
+  string value = 2;
+}
+
+// Request: client sends a batch of spans
+message ExportSpansRequest {
+  repeated Span spans = 1;
+}
+
+// Response: server replies with how many it accepted
+message ExportSpansResponse {
+  int32  accepted_spans = 1;
+  string message        = 2;
+}
+
+// ── Service ───────────────────────────────────────────────────────────────────
+
+service TelemetryService {
+  // Unary RPC: one request → one response (start here, simplest)
+  rpc ExportSpans(ExportSpansRequest) returns (ExportSpansResponse);
+
+  // Server-streaming: client sends one request, server streams back results
+  // rpc WatchAlerts(WatchRequest) returns (stream Alert);
+
+  // Client-streaming: client streams spans, server replies once
+  // rpc StreamSpans(stream Span) returns (ExportSpansResponse);
+
+  // Bidirectional streaming: both sides stream (most complex)
+  // rpc SpanPipeline(stream Span) returns (stream ExportSpansResponse);
+}

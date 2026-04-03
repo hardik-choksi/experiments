@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
 	"os"
+
+	_ "net/http/pprof"
 
 	"github.com/gin-gonic/gin"
 	"github.com/hardikchoksi151/todo-gin/config"
@@ -10,10 +14,20 @@ import (
 	"github.com/hardikchoksi151/todo-gin/internal/todo"
 	"github.com/hardikchoksi151/todo-gin/internal/user"
 	"github.com/hardikchoksi151/todo-gin/pkg/db"
+	track "github.com/middleware-labs/golang-apm/tracker"
 	"github.com/urfave/cli"
 )
 
 func main() {
+
+	tracer, err := track.Track(
+		track.WithConfigTag("service", "YOUR_SERVICE_NAME"),
+		track.WithConfigTag("accessToken", "<MW_API_KEY>"), // optional in Host mode
+	)
+	if err != nil {
+		log.Fatalf("Failed to initialize middleware: %v", err)
+	}
+	defer func() { _ = tracer.Tp.Shutdown(context.Background()) }()
 
 	app := &cli.App{
 		Name:  "todo=app",
@@ -37,10 +51,6 @@ func main() {
 					return nil
 				},
 			},
-		},
-		Action: func(c *cli.Context) error {
-			startServer()
-			return nil
 		},
 	}
 
@@ -75,6 +85,14 @@ func startServer() {
 		authorized.POST("/todos", todoHandler.CreateTodo)
 		authorized.GET("/todos", todoHandler.GetTodos)
 	}
+
+	// Start pprof server on separate port
+	go func() {
+		log.Println("Starting pprof server on :6060")
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			log.Printf("pprof server error: %v", err)
+		}
+	}()
 
 	if err := r.Run(":8080"); err != nil {
 		log.Fatalf("Failed to run server: %v", err)

@@ -33,7 +33,6 @@ func LoadConfig() *Config {
 
 func getEnv(key, defaultValue string) string {
 	if value, ok := os.LookupEnv(key); ok {
-		log.Println("==> os env ", key, " : ", value)
 		return value
 	}
 

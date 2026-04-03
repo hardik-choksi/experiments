@@ -17,5 +17,6 @@ func main() {
 
 	// MakeRequest()
 	// TaskDemo()
-	FileWriteDemo()
+	// FileWriteDemo()
+	BinaryDemo()
 }

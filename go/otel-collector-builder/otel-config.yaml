@@ -1,0 +1,31 @@
+receivers:
+  mongodb:
+    username: otel
+    password: Middleware@123
+    auth_mechanism: SCRAM-SHA-256
+    auth_source: monitoring
+    collection_interval: 10s
+    hosts:
+    - endpoint: localhost:27017
+    metrics:
+      mongodb.health:
+        enabled: true
+      mongodb.uptime:
+        enabled: true
+      mongodb.flushes.rate:
+        enabled: false
+    tls:
+      insecure: true
+      insecure_skip_verify: true
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    metrics:
+      receivers: [mongodb]
+      exporters: [prometheus, debug]
