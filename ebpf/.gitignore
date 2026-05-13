@@ -1,0 +1,27 @@
+# Binaries
+ebpf-hello
+
+# Generated eBPF files
+bpf_bpfel_x86.go
+bpf_bpfel_x86.o
+bpf_bpfeb_x86.go
+bpf_bpfeb_x86.o
+
+# eBPF source (not compiled by Go)
+*.c
+
+# Generated vmlinux
+vmlinux.h
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum

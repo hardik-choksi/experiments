@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 )
+
+const msg_t = 1024
 
 func main() {
 	defer func() {
@@ -32,14 +35,22 @@ func main() {
 func handle(conn net.Conn) {
 	defer conn.Close()
 
-	buf := make([]byte, 1024)
-	_, err := conn.Read(buf)
+	in := make([]byte, msg_t)
+	out := make([]byte, msg_t)
+
+	_, err := conn.Read(in)
 	if err != nil {
 		log.Println("Error reading from connection", err)
 		return
 	}
 
-	_, err = conn.Write(buf)
+	fmt.Printf("* [%s]: %s\n", conn.RemoteAddr(), in)
+
+	fmt.Println(">>")
+
+	fmt.Scanln(out)
+
+	_, err = conn.Write(out)
 	if err != nil {
 		log.Println("Error writing to connection", err)
 		return
