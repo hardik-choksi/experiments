@@ -2,6 +2,7 @@
 CC=gcc
 CFLAGS=-Wall -g
 BINS=libtest libstr.so runtime_libtest static_libtest
+EXTRA_BINS=libstaticstr.a libstr.h.gch
 all: $(BINS)
 
 %.o: %.c %.h
@@ -23,4 +24,4 @@ static_libtest: libtest.c
 	$(CC) $(CFLAGS) -o $@ $^ -L. -lstaticstr
 
 clean:
-	rm *.o $(BINS)
+	rm *.o $(BINS) $(EXTRA_BINS)

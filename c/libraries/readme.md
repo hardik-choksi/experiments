@@ -74,3 +74,7 @@ After generating `.a` file using `ar`, use following command to link static libr
 ```bash
 gcc -Wall -g -o static_libtest libtest.c -L. -lstaticstr
 ```
+
+## References
+- Jacob Sorber https://youtu.be/JbHmin2Wtmc?si=betLXy7geomfcqHs
+- https://www.youtube.com/playlist?list=PLIz6U0slZNq2TS1zSUjZHgxBjAJL4nb92

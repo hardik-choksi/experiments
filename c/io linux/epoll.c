@@ -3,7 +3,7 @@
 #include <unistd.h>
 
 void event_loop(int server_fd) {
-  int epfd = epoll_create1(0); // kernet side interest list
+  int epfd = epoll_create1(0); // kernet side interest set
   struct epoll_event ev = {.events = EPOLLIN, .data.fd = server_fd};
   epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
   struct epoll_event events[64];
