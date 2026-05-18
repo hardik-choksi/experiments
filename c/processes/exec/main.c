@@ -2,10 +2,10 @@
 #include <unistd.h>
 int main(int argc, char **argv) {
   if (!fork()) {
-    printf("child process\n");
+    printf("child process(%d) spawned\n", getpid());
     execlp("ls", "ls", "-lAh", NULL);
   } else {
-    printf("parent prcoess\n");
+    printf("parent(%d) prcoess...\n", getpid());
   }
 
   return 0;
