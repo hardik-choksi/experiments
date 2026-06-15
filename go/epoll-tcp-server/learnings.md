@@ -25,8 +25,36 @@ The non-blocking flag on the listening socket only makes `accept()` itself non-b
 
 If client FDs are blocking, any `read()`/`write()` on them stalls the entire event loop.
 
-### Level-triggered epoll re-fires if you don't read
-Default epoll is level-triggered: if EPOLLIN fires and you don't read the data, it fires again next `epoll_wait`. Must always drain (or at least read from) ready FDs to avoid busy-looping.
+### Level-triggered vs edge-triggered epoll
+
+Epoll has two notification modes. We use level-triggered (the default).
+
+**Level-triggered (LT)** — "tell me whenever the FD **is** ready." If data is sitting in the buffer and you don't read it, `epoll_wait` fires again. And again. It keeps telling you as long as the condition holds — like an alarm that rings until you acknowledge it.
+
+**Edge-triggered (ET)** — "tell me when the FD **becomes** ready." Fires once when data arrives. If you don't read all of it, you won't get another notification until *new* data arrives. Only fires on the **transition** from not-ready to ready — like a doorbell, one ring per visitor. Enabled by adding `EPOLLET` flag: `Events: syscall.EPOLLIN | syscall.EPOLLET`.
+
+| | Level-triggered (default) | Edge-triggered (`EPOLLET`) |
+|---|---|---|
+| Notification | Fires repeatedly while data exists | Fires once per state change |
+| Read strategy | Read some, get notified again for the rest | Must drain entire buffer in a loop until EAGAIN |
+| Risk if you miss data | None — epoll re-fires | Data sits unread forever, connection stalls |
+| Simpler to use | Yes | No — must handle partial reads carefully |
+| Performance | More `epoll_wait` returns (slight overhead) | Fewer wakeups, but more complex code |
+| Used by | Our server, most simple servers | nginx, Go's kqueue backend on macOS |
+
+**Why this matters for our server:** We read once per notification (`buf := make([]byte, 1024)`). If a client sends 4KB, we read 1KB, and level-triggered epoll fires again for the remaining 3KB. With edge-triggered, we'd need a drain loop:
+```go
+for {
+    n, err := conn.Read(buf)
+    if err == syscall.EAGAIN {
+        break // buffer drained, wait for next notification
+    }
+    // process buf[:n]
+}
+```
+Without that drain loop in ET mode, the remaining 3KB would sit unread forever — epoll wouldn't notify again because no *new* data arrived. The connection would appear to stall.
+
+**Why does edge-triggered exist if it's harder?** Performance. In level-triggered mode, if you have 10,000 connections and 5,000 have unread data, every `epoll_wait` returns all 5,000 — even if you can only process 100 per loop iteration. Edge-triggered only returns FDs where *new* data arrived since the last check, which is usually a much smaller set. nginx uses ET for this reason.
 
 ### `SO_REUSEADDR` prevents "address already in use"
 Without it, restarting the server within ~60s fails because the OS holds the socket in TIME_WAIT. Set before `bind()`:
@@ -214,8 +242,99 @@ Go program:     your code → syscall.Read() → syscall instruction → kernel
 
 This is also why Go uses `SIGURG` for goroutine preemption (causing the `EINTR` noise) — it can't rely on libc's signal handling.
 
-## How Go's `net` package does it under the hood
+## Implementing net.Conn — and why deadlines don't work in an event loop
 
-Go's standard `net` package uses epoll (Linux) / kqueue (macOS) internally via the **netpoller**. Each goroutine that calls `conn.Read()` parks on the netpoller, and the runtime wakes it when data arrives. You get the thread-per-connection programming model with event-loop efficiency — goroutines are ~4KB vs ~8MB OS threads.
+### What net.Conn requires
 
-Building the epoll loop manually is valuable for understanding, but in production Go you'd just use `net.Listen` + goroutine per connection and let the runtime handle multiplexing.
+`net.Conn` is Go's universal connection interface. Any code that does network I/O (HTTP servers, TLS, proxies) accepts `net.Conn`. It has 8 methods:
+
+| Method | Purpose |
+|---|---|
+| `Read(b []byte) (int, error)` | Receive data — wraps `read(2)` syscall |
+| `Write(b []byte) (int, error)` | Send data — wraps `write(2)` syscall |
+| `Close() error` | Done with connection — wraps `close(2)`, sends TCP FIN |
+| `LocalAddr() net.Addr` | Our side of the connection (server IP:port) |
+| `RemoteAddr() net.Addr` | Their side (client IP:ephemeral port) |
+| `SetDeadline(t time.Time) error` | Set both read + write deadline |
+| `SetReadDeadline(t time.Time) error` | How long read() waits before giving up |
+| `SetWriteDeadline(t time.Time) error` | How long write() waits before giving up |
+
+### Address methods — two syscalls we avoid
+
+Every TCP connection is a 4-tuple: `(localIP:localPort, remoteIP:remotePort)`.
+
+- **`getsockname(fd)`** — "what is MY address on this socket?" → gives the local side
+- **`getpeername(fd)`** — "who is on the OTHER end?" → gives the remote side
+
+Both are syscalls you can call anytime on a connected socket. But since addresses never change for a given connection, we store them once at `Accept` time (remote addr comes from `Accept`'s return value, local addr is our known bind address). No need to syscall on every `LocalAddr()`/`RemoteAddr()` call.
+
+The client's port is an **ephemeral port** (typically 32768–60999) assigned by the client's OS kernel. Combined with the client IP, this uniquely identifies who you're talking to — useful for logging, rate limiting, or IP-based access control.
+
+### Why deadline methods are no-ops in our server
+
+Our FDs are **non-blocking**. `read()` never waits — it returns instantly with data or `EAGAIN`. Kernel socket timeouts (`SO_RCVTIMEO`/`SO_SNDTIMEO`) only fire when `read()` is actually **blocking and waiting** for data. If you never block, there's nothing to time out.
+
+Two approaches to real deadlines:
+
+**Approach 1: Kernel socket timeouts (`SO_RCVTIMEO`/`SO_SNDTIMEO`)**
+```c
+// setsockopt sets a per-socket receive timeout
+setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeval, sizeof(timeval));
+```
+When `read()` blocks longer than the specified duration, the kernel returns `EAGAIN`. Simple but only works with **blocking** FDs. Useless for our non-blocking event loop.
+
+**Approach 2: Epoll-based deadlines (what Go's netpoller actually does)**
+
+This is the real solution and it's elegant:
+
+1. Each connection stores a deadline timestamp in a **timer heap** (min-heap sorted by earliest expiry)
+2. Before each `epoll_wait`, compute: `timeout = earliest_deadline - now`
+3. Pass that as `epoll_wait`'s timeout argument (instead of `-1` which means "wait forever")
+4. When `epoll_wait` returns due to timeout (not because an FD had data), walk the heap, find all expired deadlines, and wake those connections with `os.ErrDeadlineExceeded`
+5. Every `SetReadDeadline()` call inserts or updates an entry in the heap
+
+The key insight: **epoll_wait's timeout parameter becomes the deadline mechanism.** The event loop itself wakes up on schedule — it's not a per-socket kernel feature, it's application-level timer management layered on top of epoll.
+
+**Why we didn't implement this:** It requires a timer heap data structure, heap maintenance on every deadline set/clear/expire, and timeout-vs-I/O disambiguation after each `epoll_wait` return. That's essentially reimplementing Go's netpoller scheduler — a significant chunk of infrastructure. Our stubs return `nil` and satisfy the interface honestly.
+
+## Go's netpoller and scheduler
+
+Go's `net` package uses epoll (Linux) / kqueue (macOS) internally via the **netpoller**. When a goroutine calls `conn.Read()` and there's no data, the goroutine is **parked** (~4KB cost, no OS thread blocked). When data arrives, the netpoller wakes it via `epoll_wait` and the goroutine resumes as if `Read()` just returned. You get thread-per-connection programming with event-loop efficiency.
+
+The netpoller is deeply integrated with Go's **G-M-P scheduler** — goroutines (G), OS threads (M), and processors (P) work together so that parked goroutines don't waste threads, and the sysmon background thread handles netpolling, preemption, and deadline expiry.
+
+Building our epoll loop manually teaches what the netpoller does invisibly. In production Go you'd just use `net.Listen` + goroutine per connection and let the runtime handle multiplexing.
+
+**Deep dives:**
+- [docs/netpoller.md](docs/netpoller.md) — data structures (pollDesc, pollCache, timer heap), step-by-step Read() trace, sysmon, platform backends (epoll/kqueue/IOCP), pollDesc lifecycle, deadline expiry, comparison with our server
+- [docs/gmp-scheduler.md](docs/gmp-scheduler.md) — G/M/P entities, run queues, work stealing, syscall handoff, preemption (cooperative + SIGURG), sysmon, GOMAXPROCS, spinning threads, stack growth
+
+## Resources — netpoller and G-M-P scheduler
+
+### Design documents
+- [Scalable Go Scheduler Design Doc — Dmitry Vyukov (2012)](https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw/edit) — the original proposal that introduced P
+- [Non-cooperative goroutine preemption — Austin Clements](https://go.googlesource.com/proposal/+/master/design/24543-non-cooperative-preemption.md) — design doc for async preemption (SIGURG)
+
+### Go runtime source files (read in this order)
+1. [`runtime/runtime2.go`](https://github.com/golang/go/blob/master/src/runtime/runtime2.go) — `g`, `m`, `p` struct definitions
+2. [`runtime/proc.go`](https://github.com/golang/go/blob/master/src/runtime/proc.go) — the scheduler itself: `schedule()`, `findRunnable()`, `sysmon()`, `retake()`
+3. [`runtime/netpoll.go`](https://go.dev/src/runtime/netpoll.go) — netpoller core: `pollDesc`, `netpollblock()`
+4. `runtime/netpoll_epoll.go` — Linux epoll backend
+5. `runtime/stack.go` — stack growth, copying, shrinking
+6. [`runtime/preempt.go`](https://go.dev/src/runtime/preempt.go) — async preemption logic
+
+### Blog posts
+- [Daniel Morsing — "The Go Scheduler" (2013)](https://morsmachine.dk/go-scheduler) — best first read, short and clear
+- [Daniel Morsing — "The Go Netpoller" (2013)](https://morsmachine.dk/netpoller) — companion post
+- [Ardan Labs — "Scheduling In Go" Part I](https://www.ardanlabs.com/blog/2018/08/scheduling-in-go-part1.html) and [Part II](https://www.ardanlabs.com/blog/2018/08/scheduling-in-go-part2.html) — best modern deep-dive series
+- [Jaana Dogan — "Go's Work-Stealing Scheduler"](https://rakyll.org/scheduler/) — well-illustrated
+- [Cloudflare — "How Stacks are Handled in Go"](https://blog.cloudflare.com/how-stacks-are-handled-in-go/) — segmented-to-copying stack transition
+- [DataDog — go-profiler-notes: Goroutine Scheduler](https://datadoghq.dev/go-profiler-notes/mental-model-for-go/goroutine-scheduler.html) — exceptional detail with real diagrams
+- [Hidetatz — "Preemption in Go"](https://hidetatz.github.io/goroutine_preemption/) — traces through the SIGURG signal path
+- [Dave Cheney — "Why is a Goroutine's Stack Infinite?"](https://dave.cheney.net/2013/06/02/why-is-a-goroutines-stack-infinite)
+
+### Conference talks
+- [GopherCon 2018 — Kavya Joshi — "The Scheduler Saga"](https://www.youtube.com/watch?v=YHRO5WQGh0k) — the definitive talk, builds a scheduler from scratch
+
+### Academic papers
+- [Columbia University — "Analysis of the Go Runtime Scheduler"](http://www.cs.columbia.edu/~aho/cs6998/reports/12-12-11_DeshpandeSponslerWeiss_GO.pdf) — academic analysis of the scheduler's work-stealing behavior
