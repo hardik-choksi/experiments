@@ -106,6 +106,10 @@ if err != nil {
 
 This pattern applies to any blocking syscall (`read`, `write`, `accept`, `epoll_wait`, etc.) — `EINTR` is always safe to retry. In C you'll see the same `while (ret == -1 && errno == EINTR)` loop everywhere.
 
+**Important:** Retrying on EINTR does NOT prevent goroutine preemption — preemption already happened before we see the EINTR. The `continue` just cleans up the interrupted syscall. Also, "sending SIGURG to a goroutine" is imprecise — the runtime uses `tgkill` to target the specific OS thread (M) running that goroutine, not the goroutine itself. Signals are still process/thread-level, not goroutine-level.
+
+**Deep dive:** [docs/eintr-preemption.md](docs/eintr-preemption.md) — full preemption timeline, tgkill vs kill, why SIGURG, gsignal stacks
+
 ## EAGAIN and detecting client disconnect
 
 ### EAGAIN (errno 11)
