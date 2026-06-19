@@ -125,7 +125,7 @@ One global queue protected by `sched.lock` (a mutex). It holds goroutines that:
 - Were moved there from a P being retaken (syscall handoff)
 - Came from the netpoller (goroutines woken by I/O readiness)
 
-To prevent starvation, each P checks the global queue **every 61 scheduling events** (a prime number to avoid sync patterns). When it takes from the global queue, it takes a batch: `(global_queue_size / GOMAXPROCS) + 1`, amortizing the lock cost.
+To prevent starvation, each P checks the global queue **every 61 scheduling events** (a prime number to avoid sync patterns — see [scheduler-fairness.md — Why 61](scheduler-fairness.md#why-schedtick-checks-the-global-queue-every-61-events-not-64) for the full explanation of why prime and why specifically 61). When it takes from the global queue, it takes a batch: `(global_queue_size / GOMAXPROCS) + 1`, amortizing the lock cost.
 
 ## Work stealing
 
@@ -381,3 +381,7 @@ Order is deliberate: local work first (cache hot), global queue prevents starvat
 
 - **Columbia University — "Analysis of the Go Runtime Scheduler" (Deshpande, Sponsler, Weiss)**
   http://www.cs.columbia.edu/~aho/cs6998/reports/12-12-11_DeshpandeSponslerWeiss_GO.pdf
+
+### Companion doc
+
+- **[scheduler-fairness.md](scheduler-fairness.md)** — covers the scheduling theory: N:M models, convoy effect, why schedtick uses 61, FIFO vs LIFO tradeoffs, time slice inheritance (the 99.88% benchmark), runtime APIs (`Gosched`, `Goexit`, `LockOSThread`), and scheduler observability tools (`schedtrace`, `go tool trace`, ftrace).
