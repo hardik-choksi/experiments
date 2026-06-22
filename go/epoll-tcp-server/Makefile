@@ -1,11 +1,14 @@
 
 all: run
 
-build:
-	go build -o server .
+server:
+	go build -o $@ .
 
-run: build
-	./server
+run: server
+	./$<
+
+debug: server
+	GOMAXPROCS=4 GODEBUG=schedtrace=1000 ./$<
 
 .PHONY: clean
 

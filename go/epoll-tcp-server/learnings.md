@@ -40,7 +40,7 @@ Epoll has two notification modes. We use level-triggered (the default).
 | Risk if you miss data | None — epoll re-fires | Data sits unread forever, connection stalls |
 | Simpler to use | Yes | No — must handle partial reads carefully |
 | Performance | More `epoll_wait` returns (slight overhead) | Fewer wakeups, but more complex code |
-| Used by | Our server, most simple servers | nginx, Go's kqueue backend on macOS |
+| Used by | Redis, libevent (default), libev, Node.js (libuv), HAProxy, most epoll tutorials | nginx, Go's netpoller (epoll ET on Linux, kqueue ET on macOS), Tokio (Rust), Java NIO (via epoll ET on Linux) |
 
 **Why this matters for our server:** We read once per notification (`buf := make([]byte, 1024)`). If a client sends 4KB, we read 1KB, and level-triggered epoll fires again for the remaining 3KB. With edge-triggered, we'd need a drain loop:
 ```go
@@ -71,19 +71,26 @@ The event loop is a single cashier — if one customer takes long, everyone wait
 - When a client FD is ready, hand it to a worker thread via a queue
 - Worker does the slow work, signals main loop to close/re-arm the FD
 - Win is **resource control**: 10k connections don't need 10k threads, only threads for FDs with actual work
-- This is what memcached does
+- Used by: **memcached** (libevent + worker threads), **Redis 6+** (I/O threads for read/write, main thread for commands), **PostgreSQL** (postmaster process accepts, forks worker per connection — not epoll-based but same dispatcher pattern), **Java Netty** (boss group accepts, worker group handles I/O), **gRPC C-core** (epoll poller + thread pool for RPC handlers)
 
 ### 2. State machine (pure non-blocking)
 - Each connection has a state struct tracking its progress (reading headers → processing → writing response)
 - Handler advances the state by one small step, then returns to the event loop
 - Every stage must be short — if inherently slow, break into chunks or hybrid with a thread pool
-- This is what nginx does — every stage is I/O-bound and fast
 - Most performant but hardest to write; you're hand-coding what async/await does in higher-level languages
+- Used by: **nginx** (every stage is I/O-bound and fast, full state machine per connection), **HAProxy** (connection state machine with multi-step request/response processing), **Envoy** (filter chain where each filter advances the connection state), **Node.js** (libuv event loop — JS callbacks are the state transitions, `async`/`await` is syntactic sugar over the state machine), **Rust Tokio** (`.await` compiles down to a state machine that yields back to the executor)
 
 ### 3. io_uring (Linux 5.1+)
 - Instead of "notify me when ready, then I'll syscall," you submit the syscall itself and the kernel completes it async
 - Eliminates the two-step (poll → syscall) overhead of epoll
 - Steepest learning curve, most modern approach
+- Used by: **Tigerbeetle** (financial transactions database, built entirely on io_uring), **Tokio** (experimental io_uring backend via `tokio-uring`), **DPDK/SPDK** (high-performance networking/storage, uses io_uring for async disk I/O), **liburing** (the standard C wrapper everyone uses to talk to io_uring)
+
+### 4. Goroutine-per-connection (Go's approach)
+- Not really a fourth pattern — it's the thread-per-connection model made cheap by Go's runtime
+- Each connection gets its own goroutine (~2-4KB stack). Goroutines block on `Read()`/`Write()` but the runtime parks them and multiplexes onto a small number of OS threads via the netpoller (epoll under the hood)
+- You write blocking-style code, the runtime turns it into an event loop internally
+- Used by: **Go's net/http**, **every Go server** — the standard `go handleConn(conn)` pattern. Also similar to **Erlang/Elixir** (lightweight processes on BEAM VM) and **Java 21 virtual threads** (Project Loom — same idea, goroutines for JVM)
 
 ### Thread pool vs thread-per-connection
 Not about per-request speed. Thread-per-connection with 10k clients = 10k threads × ~8MB stack = 80GB+ memory pressure plus kernel scheduling overhead. Thread pool with 64 workers handles the same 10k connections because **most connections are idle at any moment** — epoll tells you which ones actually have data. The pool only works on active FDs.
@@ -313,7 +320,47 @@ Building our epoll loop manually teaches what the netpoller does invisibly. In p
 - [docs/netpoller.md](docs/netpoller.md) — data structures (pollDesc, pollCache, timer heap), step-by-step Read() trace, sysmon, platform backends (epoll/kqueue/IOCP), pollDesc lifecycle, deadline expiry, comparison with our server
 - [docs/gmp-scheduler.md](docs/gmp-scheduler.md) — G/M/P entities, run queues, work stealing, syscall handoff, preemption (cooperative + SIGURG), sysmon, GOMAXPROCS, spinning threads, stack growth
 
-## Resources — netpoller and G-M-P scheduler
+## Resources
+
+### Linux / POSIX man pages
+- [`man 7 epoll`](https://man7.org/linux/man-pages/man7/epoll.7.html) — epoll overview, LT vs ET behavior, usage patterns
+- [`man 2 epoll_create1`](https://man7.org/linux/man-pages/man2/epoll_create1.2.html) — create an epoll instance
+- [`man 2 epoll_ctl`](https://man7.org/linux/man-pages/man2/epoll_ctl.2.html) — add/modify/remove FDs from epoll
+- [`man 2 epoll_wait`](https://man7.org/linux/man-pages/man2/epoll_wait.2.html) — wait for events on an epoll instance
+- [`man 2 socket`](https://man7.org/linux/man-pages/man2/socket.2.html) — create a socket (SOCK_STREAM, SOCK_NONBLOCK, etc.)
+- [`man 2 bind`](https://man7.org/linux/man-pages/man2/bind.2.html) — assign an address to a socket
+- [`man 2 listen`](https://man7.org/linux/man-pages/man2/listen.2.html) — mark socket as passive (accepting connections)
+- [`man 2 accept`](https://man7.org/linux/man-pages/man2/accept.2.html) — accept a connection, returns new FD + client address
+- [`man 2 read`](https://man7.org/linux/man-pages/man2/read.2.html) — read from an FD (EAGAIN, EINTR behavior)
+- [`man 2 write`](https://man7.org/linux/man-pages/man2/write.2.html) — write to an FD
+- [`man 2 close`](https://man7.org/linux/man-pages/man2/close.2.html) — close an FD, sends TCP FIN
+- [`man 2 setsockopt`](https://man7.org/linux/man-pages/man2/setsockopt.2.html) — set socket options (SO_REUSEADDR, SO_RCVTIMEO, etc.)
+- [`man 2 getsockname`](https://man7.org/linux/man-pages/man2/getsockname.2.html) — get local address of a socket
+- [`man 2 getpeername`](https://man7.org/linux/man-pages/man2/getpeername.2.html) — get remote address of a socket
+- [`man 2 fcntl`](https://man7.org/linux/man-pages/man2/fcntl.2.html) — file descriptor control (O_NONBLOCK, FD_CLOEXEC, etc.)
+- [`man 7 tcp`](https://man7.org/linux/man-pages/man7/tcp.7.html) — TCP protocol, socket options (TCP_NODELAY, TIME_WAIT, etc.)
+- [`man 7 socket`](https://man7.org/linux/man-pages/man7/socket.7.html) — socket API overview, SO_* options
+- [`man 7 signal`](https://man7.org/linux/man-pages/man7/signal.7.html) — signal overview (relevant for EINTR, SIGURG)
+- [`man 2 tgkill`](https://man7.org/linux/man-pages/man2/tgkill.2.html) — send signal to a specific thread (used by Go for preemption)
+
+### Linux kernel source
+- [`fs/eventpoll.c`](https://github.com/torvalds/linux/blob/master/fs/eventpoll.c) — epoll implementation (red-black tree, ready list, LT/ET logic)
+- [`net/ipv4/tcp.c`](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp.c) — TCP implementation
+
+### Go stdlib source (net package + runtime)
+- [`net/net.go`](https://github.com/golang/go/blob/master/src/net/net.go) — `Conn` interface definition, `OpError`, core types
+- [`net/tcpsock.go`](https://github.com/golang/go/blob/master/src/net/tcpsock.go) — `TCPConn`, `TCPAddr`, `TCPListener` — the types you get from `net.Listen("tcp", ...)`
+- [`net/fd_posix.go`](https://github.com/golang/go/blob/master/src/net/fd_posix.go) — `netFD` struct, the real FD wrapper that `TCPConn` delegates to
+- [`net/fd_unix.go`](https://github.com/golang/go/blob/master/src/net/fd_unix.go) — Unix-specific `netFD` methods: `Read()`, `Write()`, `Accept()`, `Close()` — where syscalls actually happen
+- [`net/sock_posix.go`](https://github.com/golang/go/blob/master/src/net/sock_posix.go) — `socket()` call, SO_REUSEADDR, bind, listen — the setup path
+- [`net/dial.go`](https://github.com/golang/go/blob/master/src/net/dial.go) — `Dial()`, `DialContext()` — client-side connection
+- [`internal/poll/fd_poll_runtime.go`](https://github.com/golang/go/blob/master/src/internal/poll/fd_poll_runtime.go) — bridge between `net` and the runtime netpoller (`pollDesc` init, wait, deadline setting)
+- [`internal/poll/fd_unix.go`](https://github.com/golang/go/blob/master/src/internal/poll/fd_unix.go) — `FD.Read()`, `FD.Write()` with EAGAIN retry loops — this is where "try syscall → park goroutine → retry" lives
+- [`runtime/netpoll.go`](https://github.com/golang/go/blob/master/src/runtime/netpoll.go) — netpoller core: `pollDesc`, `netpollblock()`, timer heap for deadlines
+- [`runtime/netpoll_epoll.go`](https://github.com/golang/go/blob/master/src/runtime/netpoll_epoll.go) — Linux epoll backend: `netpollinit()`, `netpollopen()`, `netpoll()`
+- [`runtime/proc.go`](https://github.com/golang/go/blob/master/src/runtime/proc.go) — the G-M-P scheduler: `schedule()`, `findRunnable()`, `sysmon()`
+- [`runtime/runtime2.go`](https://github.com/golang/go/blob/master/src/runtime/runtime2.go) — `g`, `m`, `p` struct definitions
+- [`syscall/syscall_linux.go`](https://github.com/golang/go/blob/master/src/syscall/syscall_linux.go) — Go's raw syscall wrappers (what we use: `syscall.Socket`, `syscall.Bind`, etc.)
 
 ### Design documents
 - [Scalable Go Scheduler Design Doc — Dmitry Vyukov (2012)](https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw/edit) — the original proposal that introduced P

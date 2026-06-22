@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"syscall"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -15,6 +18,15 @@ func main() {
 			log.Println("Recovered in main\n", r)
 		}
 	}()
+
+	http.Handle("/metrics", promhttp.Handler())
+	go func() {
+		fmt.Println("prometheus server listening on :2112")
+		if err := http.ListenAndServe(":2112", nil); err != nil {
+			log.Fatalf("prometheus server failed: %v", err)
+		}
+	}()
+
 	max_clients := 511
 	// this is where server will receive events (epoller will fill this array)
 	events := make([]syscall.EpollEvent, max_clients)
@@ -94,7 +106,7 @@ func main() {
 
 				conn := NewConnection(clientFd, clientAddr, ip4, 8080)
 				Connections[clientFd] = conn
-				fmt.Printf("new connection from %s (fd=%d)\n", conn.RemoteAddr(), clientFd)
+				// fmt.Printf("new connection from %s (fd=%d)\n", conn.RemoteAddr(), clientFd)
 				// now we need to add this clientfd into our epoller object so epoller can listen to io events (especially when client sends data)
 				clientEvent := syscall.EpollEvent{
 					Events: syscall.EPOLLIN,

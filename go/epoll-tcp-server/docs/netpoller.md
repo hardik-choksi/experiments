@@ -237,6 +237,179 @@ if deadline_expired {
 return nil  // → user retries Read(), gets data
 ```
 
+## How the netpoller knows which goroutine to wake
+
+When `epoll_wait` returns "fd 7 is readable," how does the runtime find the specific goroutine waiting on that FD? The answer is a pointer chain set up at registration time — no searching, no hash lookup, O(1) per ready FD.
+
+### The epoll user-data trick
+
+`epoll_ctl` lets you attach **arbitrary user data** to every FD you register. The C struct has a union for this:
+
+```c
+// from <sys/epoll.h>
+typedef union epoll_data {
+    void    *ptr;       // arbitrary pointer (8 bytes on 64-bit)
+    int      fd;        // or just store the FD number
+    uint32_t u32;
+    uint64_t u64;
+} epoll_data_t;
+
+struct epoll_event {
+    uint32_t     events;   // EPOLLIN, EPOLLOUT, etc.
+    epoll_data_t data;     // 8 bytes — kernel stores it, hands it back untouched
+};
+```
+
+When `epoll_wait` fires, it returns the same `data` you stored. Most C programs stuff the FD number in there. Go's runtime does something smarter — it stores a **pointer to the `pollDesc`**.
+
+### Two different Go structs for the same C struct
+
+Go has **two different** representations of `struct epoll_event`, and the difference matters:
+
+**`syscall.EpollEvent`** — what userspace code (including our server) uses:
+```go
+// syscall/ztypes_linux_amd64.go
+type EpollEvent struct {
+    Events uint32
+    Fd     int32
+    Pad    int32
+}
+```
+The 8-byte `data` union is hardcoded as `Fd int32 + Pad int32`. Simple and convenient — you just set `ev.Fd = serverFD` — but you **cannot store a pointer**. The `Fd` field is only 4 bytes, and `Pad` is inaccessible filler.
+
+**`runtime.epollevent`** — what the netpoller uses internally:
+```go
+// runtime/defs_linux_amd64.go
+type epollevent struct {
+    events uint32
+    data   [8]byte   // raw 8 bytes — large enough for a 64-bit pointer
+}
+```
+The runtime defines its own struct with `data [8]byte` instead of `Fd + Pad`. This gives it access to the full 8-byte union, so it can stuff a `pollDesc` pointer in there via `unsafe.Pointer`:
+
+```go
+// runtime/netpoll_epoll.go — netpollopen()
+// This is what the runtime actually does (simplified)
+var ev epollevent
+ev.events = _EPOLLIN | _EPOLLOUT | _EPOLLRDHUP | _EPOLLET
+*(**pollDesc)(unsafe.Pointer(&ev.data)) = pd  // stash pollDesc pointer in the 8-byte data field
+epollctl(epfd, _EPOLL_CTL_ADD, int32(fd), &ev)
+```
+
+Both structs compile down to the same 12 bytes in memory — the kernel doesn't care. The difference is purely how Go exposes those bytes:
+
+| Struct | Where defined | data bytes interpreted as | Can store a pointer? | Used by |
+|---|---|---|---|---|
+| `syscall.EpollEvent` | `syscall/ztypes_linux_amd64.go` | `Fd int32` + `Pad int32` | No — only 4 bytes for FD | Our server, any userspace Go code |
+| `runtime.epollevent` | `runtime/defs_linux_amd64.go` | `data [8]byte` | Yes — via `unsafe.Pointer` | Go's netpoller internally |
+
+**Why two structs?** The `syscall` package is designed for regular Go programs — `Fd int32` covers 99% of use cases and is type-safe. The runtime needs raw byte access to store pointers, so it defines its own version. The runtime can't use `syscall.EpollEvent` because it can't fit a pointer into a 4-byte `int32` field on a 64-bit system.
+
+**Why this matters for our server:** We use `syscall.EpollEvent` and store the FD in `ev.Fd`, then look up the connection in our `Connections` map. The netpoller skips the map lookup entirely — it gets the `pollDesc` pointer directly from `ev.data`, which is O(1). We can't do the same trick with `syscall.EpollEvent` without redefining the struct ourselves.
+
+Source: [`runtime/netpoll_epoll.go` — `netpollopen()`](https://github.com/golang/go/blob/master/src/runtime/netpoll_epoll.go), [`runtime/defs_linux_amd64.go`](https://github.com/golang/go/blob/master/src/runtime/defs_linux_amd64.go), [`syscall/ztypes_linux_amd64.go`](https://github.com/golang/go/blob/master/src/syscall/ztypes_linux_amd64.go)
+
+### The full wakeup chain
+
+**Step 1 — Registration** (happens once, when `net.Listen()` or `Dial()` creates a connection):
+```
+net.Listen("tcp", ":8080")
+  → socket() returns fd=7
+  → runtime allocates pollDesc for fd 7
+  → epoll_ctl(ADD, fd=7, data=&pollDesc)    ← pollDesc pointer stored in epoll
+```
+
+**Step 2 — Parking** (goroutine G42 calls `conn.Read()`, gets EAGAIN):
+```
+G42: conn.Read(buf)
+  → syscall.Read(fd=7) returns EAGAIN
+  → runtime stores G42's pointer in pollDesc.rg:
+      pollDesc {
+          fd:  7
+          rg:  → G42    // "G42 is blocked on read for fd 7"
+          wg:  nil      // nobody blocked on write
+      }
+  → gopark(G42)         // remove from run queue, M picks up next G
+```
+
+Source: [`internal/poll/fd_unix.go` — `FD.Read()`](https://github.com/golang/go/blob/master/src/internal/poll/fd_unix.go) does the EAGAIN retry, then calls into [`runtime/netpoll.go` — `poll_runtime_pollWait()`](https://github.com/golang/go/blob/master/src/runtime/netpoll.go) which calls `netpollblock()` to park.
+
+**Step 3 — Data arrives** (client sends bytes, kernel buffers them on fd 7):
+```
+epoll_wait() returns:
+  event { events: EPOLLIN, data: *pollDesc_0xc0000a4000 }
+                                  │
+         kernel hands back the    │
+         exact pointer we stored  │
+                                  ▼
+                          pollDesc_0xc0000a4000 {
+                              rg: → G42     ← the goroutine to wake
+                              wg: nil
+                          }
+```
+
+Source: [`runtime/netpoll_epoll.go` — `netpoll()`](https://github.com/golang/go/blob/master/src/runtime/netpoll_epoll.go) calls `epoll_wait`, then for each event extracts the `pollDesc` pointer from `ev.data` (the runtime's `[8]byte` field, not `syscall.EpollEvent.Fd`).
+
+**Step 4 — Wakeup**:
+```
+runtime: extract G42 from pollDesc.rg
+runtime: set pollDesc.rg = 0 (nobody waiting anymore)
+runtime: mark G42 as runnable (Grunnable status)
+runtime: inject G42 into a P's local run queue
+  → next scheduling cycle, some M picks up G42
+  → G42 resumes at the point after gopark()
+  → retries read(fd=7) → succeeds, returns data to user
+```
+
+Source: [`runtime/netpoll.go` — `netpollunblock()`](https://github.com/golang/go/blob/master/src/runtime/netpoll.go) extracts and clears the goroutine, [`netpollready()`](https://github.com/golang/go/blob/master/src/runtime/netpoll.go) adds it to the return list for the scheduler.
+
+### Why `rg` and `wg` are separate
+
+`pollDesc` has two goroutine slots because read and write are independent TCP operations. One goroutine can be blocked reading while another is blocked writing on the **same FD**:
+
+```
+pollDesc {
+    rg: → G42    // waiting for EPOLLIN  (data to read)
+    wg: → G88    // waiting for EPOLLOUT (write buffer space)
+}
+```
+
+When `epoll_wait` returns with `EPOLLIN`, only G42 is woken. G88 stays parked until `EPOLLOUT` fires. The runtime checks `ev.Events` to decide which slot(s) to drain:
+
+```go
+// runtime/netpoll_epoll.go — netpoll(), simplified
+var mode int32
+if ev.Events&(syscall.EPOLLIN|syscall.EPOLLRDHUP|syscall.EPOLLHUP|syscall.EPOLLERR) != 0 {
+    mode += 'r'  // wake the reader
+}
+if ev.Events&(syscall.EPOLLOUT|syscall.EPOLLHUP|syscall.EPOLLERR) != 0 {
+    mode += 'w'  // wake the writer
+}
+netpollready(&toRun, pd, mode)
+```
+
+Note: `EPOLLHUP` and `EPOLLERR` wake **both** — if the connection is broken, both reader and writer need to know.
+
+### Contrast with our server
+
+In our server, we use the same epoll mechanism but without the goroutine plumbing:
+
+| Aspect | Our server | Go's netpoller |
+|---|---|---|
+| What's stored in `epoll_event.Data` | Nothing (we look up FD in our `Connections` map) | Pointer to `pollDesc` (O(1) to goroutine) |
+| What we find when FD is ready | `*Connection` struct | `*pollDesc` → parked goroutine |
+| How we "wake" | Directly handle in event loop | Put goroutine back on scheduler run queue |
+| Concurrent read+write | Not supported (single-threaded loop) | Two goroutines via `rg`/`wg` slots |
+
+### Why this is O(1) — no searching
+
+The critical design insight: **the pointer chain is set up at registration, not at lookup time.** When data arrives:
+1. `epoll_wait` hands back the `pollDesc` pointer — no map lookup, the kernel stored it for us
+2. `pollDesc.rg` is a direct goroutine pointer — no searching through run queues
+3. Adding a goroutine to a run queue is O(1) — it's a linked list append
+
+Compare this to a naive approach where you'd need: `fd → hash map lookup → connection → find goroutine → search scheduler queues`. The netpoller avoids all of that.
+
 ## How our epoll server compares to the netpoller
 
 | Aspect | Our server | Go's netpoller |
@@ -270,20 +443,31 @@ This looks like thread-per-connection but performs like an event loop, because u
 ### Design documents
 - [Non-cooperative goroutine preemption — Austin Clements](https://go.googlesource.com/proposal/+/master/design/24543-non-cooperative-preemption.md) — covers SIGURG, relevant to netpoller wakeup
 
-### Go runtime source files
-1. [`runtime/netpoll.go`](https://go.dev/src/runtime/netpoll.go) — platform-agnostic core: `pollDesc`, `netpollblock()`, `netpollunblock()`
-2. `runtime/netpoll_epoll.go` — Linux epoll backend (the one we're reimplementing)
-3. `runtime/netpoll_kqueue.go` — macOS/BSD backend
-4. `runtime/netpoll_windows.go` — Windows IOCP backend
-5. `net/fd_unix.go` — the `netFD` wrapper connecting `net.Conn` to the netpoller
-6. [`runtime/proc.go`](https://github.com/golang/go/blob/master/src/runtime/proc.go) — `sysmon()` and `findRunnable()` which call `netpoll()`
+### Go runtime source files (goroutine wakeup path, in call order)
+1. [`internal/poll/fd_unix.go`](https://github.com/golang/go/blob/master/src/internal/poll/fd_unix.go) — `FD.Read()` / `FD.Write()`: EAGAIN retry loop, calls `pollDesc.waitRead()`/`waitWrite()` to park
+2. [`internal/poll/fd_poll_runtime.go`](https://github.com/golang/go/blob/master/src/internal/poll/fd_poll_runtime.go) — bridge to runtime: `pollDesc.init()` registers FD, `waitRead()`/`waitWrite()` call `poll_runtime_pollWait()`
+3. [`runtime/netpoll.go`](https://github.com/golang/go/blob/master/src/runtime/netpoll.go) — platform-agnostic core: `pollDesc` struct, `netpollblock()` (parks goroutine into `rg`/`wg`), `netpollunblock()` (extracts goroutine), `netpollready()` (adds to runnable list)
+4. [`runtime/netpoll_epoll.go`](https://github.com/golang/go/blob/master/src/runtime/netpoll_epoll.go) — Linux epoll backend: `netpollopen()` (stores `pollDesc` pointer in `epoll_event.Data`), `netpoll()` (calls `epoll_wait`, extracts `pollDesc` from returned events, checks `EPOLLIN`/`EPOLLOUT` to decide `rg` vs `wg`)
+5. `runtime/netpoll_kqueue.go` — macOS/BSD backend (same interface, different syscalls)
+6. `runtime/netpoll_windows.go` — Windows IOCP backend
+7. [`net/fd_unix.go`](https://github.com/golang/go/blob/master/src/net/fd_unix.go) — `netFD` wrapper connecting `net.Conn` methods to `internal/poll.FD`
+8. [`runtime/proc.go`](https://github.com/golang/go/blob/master/src/runtime/proc.go) — `sysmon()` calls `netpoll()` periodically, `findRunnable()` calls `netpoll(0)` non-blocking before parking
+
+### Linux man pages (epoll internals)
+- [`man 7 epoll`](https://man7.org/linux/man-pages/man7/epoll.7.html) — epoll overview, documents `epoll_data_t` union (the user-data field the netpoller uses to store `pollDesc` pointers)
+- [`man 2 epoll_ctl`](https://man7.org/linux/man-pages/man2/epoll_ctl.2.html) — documents `struct epoll_event` and the `data` field: "data that the kernel should save and then return (via `epoll_wait`) when this file descriptor becomes ready"
+- [`man 2 epoll_wait`](https://man7.org/linux/man-pages/man2/epoll_wait.2.html) — documents that returned events contain the same `data` stored via `epoll_ctl`
+
+### Linux kernel source
+- [`fs/eventpoll.c`](https://github.com/torvalds/linux/blob/master/fs/eventpoll.c) — epoll implementation: the `ep_item` struct stores user data, `ep_send_events()` copies it back to userspace on `epoll_wait`
 
 ### Blog posts
 - [Daniel Morsing — "The Go Netpoller" (2013)](https://morsmachine.dk/netpoller) — best first read on the netpoller specifically
 - [Daniel Morsing — "The Go Scheduler" (2013)](https://morsmachine.dk/go-scheduler) — companion post, needed for context
-- [SoByte — "Explaining the Golang I/O Multiplexing Netpoller Model"](https://www.sobyte.net/post/2022-01/go-netpoller/) — detailed modern walkthrough
+- [SoByte — "Explaining the Golang I/O Multiplexing Netpoller Model"](https://www.sobyte.net/post/2022-01/go-netpoller/) — detailed modern walkthrough, traces the full `Read()` → `netpollblock()` → `epoll_wait` → wakeup path
 - [DataDog — go-profiler-notes: Goroutine Scheduler](https://datadoghq.dev/go-profiler-notes/mental-model-for-go/goroutine-scheduler.html) — covers netpoller integration with scheduler
 - [Ardan Labs — "Scheduling In Go" Part II](https://www.ardanlabs.com/blog/2018/08/scheduling-in-go-part2.html) — covers how network I/O interacts with the scheduler
+- [Stoney Jackson — "Go's Netpoller and goroutine parking"](https://stonyjack.com/posts/go-netpoller/) — walks through `pollDesc.rg`/`wg` mechanics and the EAGAIN→park→wake cycle
 
 ### Conference talks
 - [GopherCon 2018 — Kavya Joshi — "The Scheduler Saga"](https://www.youtube.com/watch?v=YHRO5WQGh0k) — covers netpoller as part of the scheduler deep dive
