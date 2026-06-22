@@ -71,7 +71,7 @@ P is the "execution context" — a virtual processor. An M **must hold a P** to 
 | `deferpool` | Reusable defer structs |
 | `timers` | Per-P timer heap (for `time.Sleep`, deadlines) |
 | `status` | `_Pidle`, `_Prunning`, `_Psyscall`, `_Pgcstop`, `_Pdead` |
-| `schedtick` | Incremented each schedule event (sysmon uses this to detect stuck goroutines) |
+| `schedtick` | Incremented in `execute()` when `inheritTime == false` (sysmon uses this to detect stuck goroutines) |
 | `syscalltick` | Incremented on each syscall (sysmon uses this for handoff detection) |
 
 **How many Ps?** Exactly `GOMAXPROCS` (default = `runtime.NumCPU()`). This is the actual parallelism control — it caps how many goroutines can run simultaneously, not how many OS threads exist.
@@ -125,7 +125,19 @@ One global queue protected by `sched.lock` (a mutex). It holds goroutines that:
 - Were moved there from a P being retaken (syscall handoff)
 - Came from the netpoller (goroutines woken by I/O readiness)
 
-To prevent starvation, each P checks the global queue **every 61 scheduling events** (a prime number to avoid sync patterns — see [scheduler-fairness.md — Why 61](scheduler-fairness.md#why-schedtick-checks-the-global-queue-every-61-events-not-64) for the full explanation of why prime and why specifically 61). When it takes from the global queue, it takes a batch: `(global_queue_size / GOMAXPROCS) + 1`, amortizing the lock cost.
+To prevent starvation, each P checks the global queue **every 61 scheduling events** (a prime number to avoid sync patterns — see [scheduler-fairness.md — Why 61](scheduler-fairness.md#why-schedtick-checks-the-global-queue-every-61-events-not-64) for the full explanation of why prime and why specifically 61).
+
+The actual check in `schedule()`:
+```go
+// runtime/proc.go — schedule()
+if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
+    lock(&sched.lock)
+    gp = globrunqget(_g_.m.p.ptr(), 1)   // max = 1, takes exactly one
+    unlock(&sched.lock)
+}
+```
+
+On the 61st tick it takes exactly **1** goroutine (not a batch). The batch take happens when `findRunnable()` checks the global queue later in its search: `globrunqget(_p_, 0)` with `max=0` which means "take `(runqsize / GOMAXPROCS) + 1`", amortizing the lock cost.
 
 ## Work stealing
 
@@ -267,6 +279,181 @@ The invariant: **at most 1 spinning M per idle P**. Total spinning Ms ≤ GOMAXP
 
 This is why Go has low scheduling latency: the first goroutine after a quiet period gets picked up almost instantly.
 
+## Thread lifecycle: parking, spinning, sleeping
+
+These three words describe what an M (OS thread) does when it has no goroutine to run. They're distinct states with very different CPU and latency costs.
+
+### Parking — "I have no work, wake me when there is some"
+
+A parked M has released its P and is suspended inside a futex wait (see below). It consumes **zero CPU**. The OS kernel has removed the thread from its run queue — it won't be scheduled on any core until something wakes it.
+
+The parking sequence in `stopm()`:
+```
+M has no work and no P
+  → mput(m)                    // add M to sched.midle linked list
+  → notesleep(&m.park)         // sleep on M's note (futex wait)
+  → ... thread is frozen here until notewakeup() ...
+  → noteclear(&m.park)         // reset the note for next use
+  → acquirep(m.nextp)          // grab the P that was handed to us
+  → continue scheduling
+```
+
+What wakes a parked M? `startm()` — called when new work appears (goroutine created, work stolen, etc.). It pops an M from `sched.midle` and calls `notewakeup(&m.park)`, which does a `futex(FUTEX_WAKE)` syscall to wake the specific thread.
+
+### Spinning — "I have a P but no G, let me look around"
+
+A spinning M holds a P and actively polls for work: checking the global queue, netpoll, trying to steal from other Ps. It burns CPU doing this — it's the opposite of parking.
+
+Why waste CPU? Because the alternative — parking the M and waking it later — has latency cost. A spinning M picks up new work in **nanoseconds** (just a memory read). Waking a parked M takes **microseconds** (futex wake → kernel reschedule → context switch).
+
+The tradeoff is controlled: the runtime keeps at most **one spinning M per idle P**, capped at GOMAXPROCS total. If a spinning M finds nothing after exhausting all sources (`findRunnable()` checks everything), it releases its P and parks.
+
+### Sleeping — "the kernel took me off the CPU"
+
+"Sleeping" isn't a Go runtime state — it's what the **OS kernel** does to a thread. When a thread calls `futex(FUTEX_WAIT)` (parked M) or is blocked in a syscall (M in `_Gsyscall`), the kernel marks it `TASK_INTERRUPTIBLE` (shows as `S` in `ps`) and removes it from the CPU run queue. The thread uses zero CPU cycles until the kernel wakes it.
+
+When you run `ps -T` on a Go program, most threads show state `S` (sleeping) — they're either parked Ms waiting on a futex, or Ms blocked in syscalls.
+
+### Summary
+
+| State | Has P? | Has G? | CPU cost | Latency to pick up work | How it ends |
+|---|---|---|---|---|---|
+| **Running** | Yes | Yes | Full core | 0 (already running) | G finishes or yields |
+| **Spinning** | Yes | No | Full core (polling) | Nanoseconds | Finds work or parks |
+| **Parked** | No | No | Zero | Microseconds (futex wake) | `startm()` wakes it |
+| **Syscall-blocked** | Lost (handoff) | Yes (blocked) | Zero | Depends on syscall | Syscall returns |
+
+### Futex — the parking mechanism
+
+How does `notesleep` actually suspend a thread? Through **futex** — Fast Userspace Mutex.
+
+A futex is a Linux kernel primitive (`man 2 futex`) built around a single `uint32` in user memory. The key insight: the **uncontended path** (no waiting needed) is pure userspace — just an atomic compare-and-swap on that uint32, no syscall at all. Only when a thread actually needs to wait does it enter the kernel.
+
+Two operations:
+- **`futex(addr, FUTEX_WAIT, expected_val)`** — "if `*addr == expected_val`, put me to sleep. Otherwise return immediately." The kernel atomically checks the value and sleeps the thread — no race between checking and sleeping.
+- **`futex(addr, FUTEX_WAKE, n)`** — "wake up to `n` threads sleeping on this address."
+
+Go's runtime wraps futex in a `note` type — a one-shot sleep/wakeup primitive:
+
+```go
+// runtime/lock_futex.go (simplified)
+type note struct {
+    key uintptr  // 0 = not yet notified, 1 = notified
+}
+
+func notesleep(n *note) {
+    for atomic.Load(&n.key) == 0 {
+        futexsleep(&n.key, 0, -1)  // sleep until key != 0
+    }
+}
+
+func notewakeup(n *note) {
+    atomic.Store(&n.key, 1)
+    futexwakeup(&n.key, 1)  // wake one sleeper
+}
+```
+
+This is what `stopm()` uses to park an M. The M calls `notesleep(&m.park)` → futex wait. When `startm()` calls `notewakeup(&m.park)`, the futex wakes the thread. One-shot means once notified, the note stays in "notified" state until explicitly cleared with `noteclear()`.
+
+### Idle lists: `sched.midle` and `sched.pidle`
+
+Parked Ms and unused Ps are tracked in singly-linked lists, both protected by `sched.lock`:
+
+```
+sched.midle:  M7 → M4 → M2 → nil     (idle Ms, available for work)
+sched.pidle:  P3 → P1 → nil           (idle Ps, no M attached)
+sched.nmidle: 3                        (count of idle Ms)
+sched.npidle: 2                        (count of idle Ps)
+```
+
+When `startm()` needs to wake a thread for new work: pop from `sched.midle`. If empty, create a new M via `newm()` → `pthread_create`. When `handoffp()` needs to give a P to an M after syscall handoff: pop from `sched.midle`, attach the P, wake the M.
+
+## M (OS thread) states
+
+G states and P states are listed above. Here are all M states — the runtime doesn't track these as an enum like G/P, but an M is always in one of these situations:
+
+| State | Description | P attached? | G running? |
+|---|---|---|---|
+| **Running user code** | Executing a goroutine on a core | Yes | Yes |
+| **Running scheduler** | On g0 stack, in `schedule()`/`findRunnable()` | Yes | No (between Gs) |
+| **Spinning** | In `findRunnable()`, actively polling for work | Yes | No |
+| **Parked (idle)** | In `stopm()` → `notesleep()`, on `sched.midle` list | No | No |
+| **Blocked in syscall** | OS thread blocked in kernel (file I/O, CGo, etc.) | No (P handed off) | Yes (`_Gsyscall`) |
+| **Locked, parked** | `LockOSThread` G is blocked, M parked in `stoplockedm()` | No (P released) | Technically yes (locked G) |
+| **Sysmon** | The special monitoring thread, runs without a P | No (never has one) | No (runs on g0) |
+
+When an M has no work and no P, it goes to `sched.midle`. When work appears, `startm()` pulls it off and gives it a P. If `sched.midle` is empty, `newm()` creates a fresh OS thread via `pthread_create` (or `clone` on Linux since Go bypasses libc).
+
+**When are threads killed?** Almost never during normal operation. The runtime reuses parked Ms. Threads are only destroyed when:
+- A `LockOSThread` goroutine exits — the locked M is killed via `mexit()` since no other G can ever use it
+- `debug.SetMaxThreads` limit is hit — the runtime panics rather than creating more
+- The process exits
+
+## Channel blocking — where goroutines actually go
+
+When a goroutine blocks on a channel operation, it does **not** go to any run queue. It goes onto the **channel's own wait queue**.
+
+Each channel has two wait queues:
+```go
+type hchan struct {
+    // ...
+    recvq  waitq   // goroutines blocked in <- ch
+    sendq  waitq   // goroutines blocked in ch <- val
+}
+```
+
+Each waiting goroutine is wrapped in a `sudog` struct (short for "sudo goroutine" — a goroutine that's waiting on a synchronization primitive). The `sudog` holds a pointer to the G and sits in the channel's linked list.
+
+### Blocking receive example
+
+```
+G5 executes:  val := <- ch    (channel is empty)
+
+1. G5 creates a sudog{g: G5, elem: &val}
+2. sudog is enqueued on ch.recvq
+3. G5 transitions: _Grunning → _Gwaiting
+4. gopark() — M releases G5, picks up next G from P's runq
+```
+
+G5 is now parked on the **channel**, not on any P's run queue or the global queue.
+
+### Unblocking: where the woken goroutine goes
+
+```
+G9 executes:  ch <- 42    (G5 is waiting in recvq)
+
+1. G9 dequeues G5's sudog from ch.recvq
+2. G9 copies the value 42 directly into G5's stack variable (&val)
+3. G5 transitions: _Gwaiting → _Grunnable
+4. goready(G5) → runqput(p, G5, next=true)
+   G5 goes into the SENDER's P.runnext — not the global queue
+```
+
+G5 goes into `runnext` of the P that G9 is running on. This is the LIFO priority + time slice inheritance mechanism from [scheduler-fairness.md](scheduler-fairness.md#fifo-vs-lifo--and-how-go-uses-both). G5 inherits G9's remaining time slice and runs next on that P — producer and consumer ping-pong with hot caches.
+
+## Startup sequence
+
+At program start, the Go runtime creates minimal infrastructure:
+
+```
+1. Thread M0 is the initial OS thread (the one the OS gave us)
+2. M0 creates the sysmon thread (M_sysmon)
+   → Total threads: 2
+
+3. Runtime allocates GOMAXPROCS P structs (e.g., P0–P15 on a 16-core machine)
+   → Only P0 is attached to M0
+   → P1–P15 go into sched.pidle (idle list)
+
+4. main.main() goroutine runs on M0+P0
+   → If it spawns goroutines, they go into P0's local runq
+   → If P0's runq overflows or wakep() fires:
+     startm() → pull M from sched.midle (empty at first!)
+     → newm() creates a new OS thread via clone()
+     → new M grabs an idle P from sched.pidle
+```
+
+**Lazy thread creation:** the runtime doesn't create GOMAXPROCS threads at startup. It creates threads on demand as work appears. If your program only has 3 goroutines running concurrently, you'll only have ~4-5 OS threads total (3 workers + sysmon + maybe 1 idle). This is why `ps -T` on a lightly loaded Go server shows fewer threads than GOMAXPROCS.
+
 ## Goroutine stack mechanics
 
 ### The stack check prologue
@@ -316,6 +503,20 @@ When `schedule()` runs on an M, `findRunnable()` does the following in order:
 ```
 
 Order is deliberate: local work first (cache hot), global queue prevents starvation, stealing is last resort (avoid thrashing other P's caches), netpoll checked multiple times to minimize I/O latency.
+
+### Who calls `schedule()`?
+
+`schedule()` never returns — it always finds a G and jumps to it via `execute()` → `gogo()`. It's entered from 5 paths:
+
+| Caller | When | What happened to the previous G |
+|---|---|---|
+| `park_m()` | Goroutine called `gopark()` (channel, mutex, netpoller, timer) | G → `_Gwaiting`, removed from all queues |
+| `goexit0()` | Goroutine's function returned | G → `_Gdead`, put on free list for reuse |
+| `goschedImpl()` | Voluntary yield (`Gosched()`) or async preemption via SIGURG | G → `_Grunnable`, put on **global** run queue |
+| `mstart1()` | A brand-new M starts up for the first time | No previous G — M just started |
+| `exitsyscall0()` | Goroutine returned from syscall but couldn't get a P | G → `_Grunnable`, put on global queue; M may park |
+
+All of these switch to the M's g0 stack before calling `schedule()`. User goroutine stacks are small (start at 2KB); scheduling code runs on g0's larger stack.
 
 ## Resources
 
@@ -382,6 +583,7 @@ Order is deliberate: local work first (cache hot), global queue prevents starvat
 - **Columbia University — "Analysis of the Go Runtime Scheduler" (Deshpande, Sponsler, Weiss)**
   http://www.cs.columbia.edu/~aho/cs6998/reports/12-12-11_DeshpandeSponslerWeiss_GO.pdf
 
-### Companion doc
+### Companion docs
 
 - **[scheduler-fairness.md](scheduler-fairness.md)** — covers the scheduling theory: N:M models, convoy effect, why schedtick uses 61, FIFO vs LIFO tradeoffs, time slice inheritance (the 99.88% benchmark), runtime APIs (`Gosched`, `Goexit`, `LockOSThread`), and scheduler observability tools (`schedtrace`, `go tool trace`, ftrace).
+- **[go-sched-que.md](go-sched-que.md)** — Q&A deep dive: parking/spinning/sleeping from scratch, OS thread states, futex, semaphores, notesleep/notewakeup, all G/M/P states, schedule()/execute()/goready() call chains, channels vs pipes, LockOSThread edge cases.

@@ -153,6 +153,49 @@ if err == syscall.EAGAIN {
 }
 ```
 
+## Observing threads: what `ps -T` shows on our server
+
+Running `ps -T -p <pid>` on our Go epoll server shows the per-thread view. On a 16-core machine with GOMAXPROCS=16, you might see only ~6 threads. Here's what the output means:
+
+```
+PID    SPID   TTY      STAT   TIME  COMMAND
+12345  12345  pts/0    Sl+    0:00  ./epoll-tcp-server
+12345  12346  pts/0    Sl+    0:00  ./epoll-tcp-server
+12345  12347  pts/0    Sl+    0:00  ./epoll-tcp-server
+...
+```
+
+**SPID** = System Process ID. On Linux, every thread has its own kernel `task_struct` with a unique TID (thread ID). `SPID` is that TID. The runtime uses this with `tgkill(pid, spid, SIGURG)` to send preemption signals to specific threads.
+
+**STAT column decoded** — each character means something:
+
+| Char | Meaning |
+|---|---|
+| `S` | **Sleeping** — `TASK_INTERRUPTIBLE`. Thread is waiting on something (futex, epoll_wait, syscall). Zero CPU. Can be woken by a signal. |
+| `l` | **Multi-threaded** — process has multiple threads (all Go programs do). |
+| `+` | **Foreground process group** — running in the foreground of its terminal. |
+
+So `Sl+` = sleeping multi-threaded foreground process. Nearly all threads in a Go program show `S` because they're either:
+- **Parked Ms** — waiting in `notesleep()` → `futex(FUTEX_WAIT)` for work
+- **Sysmon** — sleeping between iterations (adaptive 20μs–10ms delay)
+- **Blocked in epoll_wait** — our main goroutine's M, waiting for network events
+
+**Why only ~6 threads when GOMAXPROCS=16?** The runtime creates threads **lazily**. At startup it only creates M0 + sysmon (2 threads). Additional threads are created on demand by `startm()` → `newm()` as goroutines need them. A lightly loaded server with few concurrent goroutines never needs all 16 Ps to have active Ms. The unused Ps sit in `sched.pidle` waiting.
+
+### OS thread states (what the kernel tracks)
+
+Every thread in Linux is in one of these kernel states:
+
+| State | `ps` shows | Meaning |
+|---|---|---|
+| `TASK_RUNNING` | `R` | On CPU or in kernel's run queue ready to go |
+| `TASK_INTERRUPTIBLE` | `S` | Sleeping, can be woken by signal (most Go threads) |
+| `TASK_UNINTERRUPTIBLE` | `D` | Sleeping, CANNOT be woken by signal (disk I/O, NFS) |
+| `__TASK_STOPPED` | `T` | Stopped by debugger (SIGSTOP/ptrace) |
+| `EXIT_ZOMBIE` | `Z` | Thread exited but parent hasn't called wait() yet |
+
+`D` state is the scary one — a thread in `D` can't be killed even with `SIGKILL`. It's waiting on something that the kernel insists must complete (usually disk I/O or an NFS mount). If you see many `D` threads, you likely have a storage problem.
+
 ## Systems programming glossary — the layer cake
 
 ```
@@ -317,8 +360,12 @@ The netpoller is deeply integrated with Go's **G-M-P scheduler** — goroutines 
 Building our epoll loop manually teaches what the netpoller does invisibly. In production Go you'd just use `net.Listen` + goroutine per connection and let the runtime handle multiplexing.
 
 **Deep dives:**
+- [docs/go-scheduler-deep-dive.md](docs/go-scheduler-deep-dive.md) — narrative walkthrough of the Go scheduler based on GopherCon 2021 talk: GMP model, run queues, work stealing, preemption evolution, time slice inheritance, LockOSThread, suggested learning path
+- [docs/gmp-scheduler.md](docs/gmp-scheduler.md) — struct-level GMP details, run queues, work stealing, syscall handoff, preemption (cooperative + SIGURG), sysmon, GOMAXPROCS, spinning threads, parking/sleeping/futex, channel blocking, startup sequence, stack growth
+- [docs/scheduler-fairness.md](docs/scheduler-fairness.md) — N:M models, convoy effect, why schedtick uses 61, FIFO vs LIFO, time slice inheritance, LockOSThread deep mechanics (stoplockedm/startlockedm), runtime APIs, observability
 - [docs/netpoller.md](docs/netpoller.md) — data structures (pollDesc, pollCache, timer heap), step-by-step Read() trace, sysmon, platform backends (epoll/kqueue/IOCP), pollDesc lifecycle, deadline expiry, comparison with our server
-- [docs/gmp-scheduler.md](docs/gmp-scheduler.md) — G/M/P entities, run queues, work stealing, syscall handoff, preemption (cooperative + SIGURG), sysmon, GOMAXPROCS, spinning threads, stack growth
+- [docs/eintr-preemption.md](docs/eintr-preemption.md) — SIGURG preemption timeline, tgkill vs kill, why epoll_wait returns EINTR, gsignal stacks
+- [docs/go-sched-que.md](docs/go-sched-que.md) — Q&A format: parking/spinning/sleeping explained from scratch, OS thread states, futex, semaphores, all G/M/P states, schedule()/execute()/goready() internals, channels vs pipes, LockOSThread edge cases
 
 ## Resources
 

@@ -60,7 +60,22 @@ Short-lived goroutines repeatedly get stuck behind 10ms slices from the hog. By 
 
 [gmp-scheduler.md](gmp-scheduler.md#run-queues-local-vs-global) mentions that each P checks the global queue every 61 scheduling events. Here's **why 61** specifically:
 
-The `schedtick` counter on each P increments every time the scheduler finds and executes a runnable goroutine. The check is:
+The `schedtick` counter on each P increments in `execute()` — but only when `inheritTime == false`:
+
+```go
+// runtime/proc.go — execute()
+func execute(gp *g, inheritTime bool) {
+    casgstatus(gp, _Grunnable, _Grunning)
+    if !inheritTime {
+        _g_.m.p.ptr().schedtick++
+    }
+    gogo(&gp.sched)  // jump to goroutine's saved PC/SP
+}
+```
+
+When `inheritTime == true` (the goroutine was in `runnext` and inherits the previous G's time slice), `schedtick` does NOT increment. This means inherited goroutines don't count toward the 61-tick global queue check — the producer-consumer pair shares one tick.
+
+The check is:
 
 ```go
 if _p_.schedtick%61 == 0 && sched.runqsize > 0 {
@@ -168,7 +183,49 @@ unix.Setns(int(netns.Fd()), unix.CLONE_NEWNET)
 
 **Gotcha**: if a goroutine locked to a thread spawns a new goroutine, the child has **no guarantee** of running on the locked thread. Don't assume child goroutines inherit the thread lock.
 
-`LockOSThread` acts as a taint: the runtime will not create child threads from this locked M for goroutine execution.
+#### How LockOSThread works internally
+
+`LockOSThread()` sets two pointers: `g.lockedm = m` and `m.lockedg = g`. The scheduler checks these during scheduling decisions.
+
+**When the locked G blocks** (channel receive, mutex, I/O), the M can't run other goroutines — but it also can't sit idle holding a P. So `stoplockedm()` runs:
+
+```
+Locked G blocks (e.g., channel receive)
+  → park_m() → stoplockedm()
+    → releasep()           // detach P from this M
+    → handoffp(p)          // give P to another M (or idle list)
+    → notesleep(&m.park)   // park this M — thread sleeps on futex
+```
+
+The M releases its P so other goroutines aren't starved, then parks. It does NOT run any other goroutine — it just sleeps.
+
+**When the locked G unblocks**, `startlockedm()` hands a P specifically to that locked M:
+
+```
+G unblocks (e.g., channel send wakes it)
+  → startlockedm(gp)
+    → p = acquirep(...)     // get a P (from idle list or steal)
+    → m.nextp = p           // stage the P for the locked M
+    → notewakeup(&m.park)   // wake the parked M
+    → the current M continues with a different G
+```
+
+The locked M wakes up, grabs the staged P, and resumes its locked G. The M that unblocked it goes on to run something else.
+
+**When the locked G exits**, the M is killed:
+
+```
+Locked G finishes (goexit)
+  → goexit0()
+    → if m.lockedg != nil: mexit()  // this thread is permanently tainted
+    → mexit() exits the OS thread
+```
+
+The thread is destroyed because no other goroutine can ever use it — the lock is permanent until `UnlockOSThread()` or G exit.
+
+#### Why namespaces need LockOSThread
+
+Linux namespaces are a **per-thread** property, not per-process. Each OS thread has its own `task_struct` in the kernel with its own namespace pointers. `setns()` only changes the calling thread's namespace. Without `LockOSThread`, the Go scheduler could move your goroutine to a different M (one that's still in the default namespace) between the `setns()` call and the subsequent network operation — your `net.Dial()` would silently use the wrong namespace.
 
 ### `runtime.NumGoroutine()`
 
@@ -272,3 +329,8 @@ You'll see SIGURG signals sent to specific thread IDs at ~10ms intervals — dir
 | Paper | What it adds |
 |-------|-------------|
 | [Scheduling Multithreaded Computations by Work Stealing](https://dl.acm.org/doi/10.1145/324133.324234) — Blumofe & Leiserson (JACM 1999) | Foundational paper on work-stealing. Proves expected time O(T₁/P + T∞). Go's work stealing descends from this. |
+
+### Companion docs
+
+- **[gmp-scheduler.md](gmp-scheduler.md)** — GMP model, struct details, run queues, work stealing, syscall handoff, preemption, thread lifecycle (parking/spinning/sleeping/futex), channel blocking, startup sequence, stacks.
+- **[go-sched-que.md](go-sched-que.md)** — Q&A deep dive covering everything above in question-and-answer format, with source code citations and code traces.
