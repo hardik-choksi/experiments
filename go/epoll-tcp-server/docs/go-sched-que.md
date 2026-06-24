@@ -927,5 +927,744 @@ The preemption is essentially a brief detour — the G takes a trip through the 
 - [`pkg.go.dev/runtime#LockOSThread`](https://pkg.go.dev/runtime#LockOSThread) — official documentation
 - [Commit d0f8a75](https://github.com/golang/go/commit/d0f8a7517ab0b33c8e3dd49294800dd6144e4cee) — `lockedExt` fix for namespace safety
 - [`setns(2)` man page](https://man7.org/linux/man-pages/man2/setns.2.html) — per-thread namespace semantics
+
+---
+
+# Part 3: Go Concurrency Primitives — From Scratch
+
+## Where does a parked goroutine actually live?
+
+This is one of the most common misconceptions. When a goroutine is "parked" (state `_Gwaiting`), it does NOT go onto any idle list. There is no `gidle` list for waiting goroutines.
+
+### What parking physically means
+
+The goroutine's `runtime.g` struct stays exactly where it was — allocated on the heap. Its stack stays allocated. **Nothing moves.** What changes is:
+
+1. The `atomicstatus` field goes from `_Grunning` (2) to `_Gwaiting` (4)
+2. The G is detached from its M (OS thread) via `dropg()`
+3. The G is **removed from all run queues** — no scheduler will ever find it by scanning queues
+4. The M calls `schedule()` to pick up a different G
+
+The `gopark()` function orchestrates this (from `runtime/proc.go`):
+
+```go
+func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason waitReason, ...) {
+    mp := acquirem()
+    gp := mp.curg
+    mp.waitlock = lock
+    mp.waitunlockf = unlockf
+    gp.waitreason = reason
+    releasem(mp)
+    mcall(park_m)       // switch to g0 stack, call park_m
+}
+```
+
+Then `park_m` runs on the M's g0 stack:
+
+```go
+func park_m(gp *g) {
+    casgstatus(gp, _Grunning, _Gwaiting)   // state change
+    dropg()                                  // detach G from M
+    if fn := _g_.m.waitunlockf; fn != nil {
+        ok := fn(gp, _g_.m.waitlock)         // release the lock atomically
+        if !ok {
+            casgstatus(gp, _Gwaiting, _Grunnable)
+            execute(gp, true)                // abort park, resume G
+        }
+    }
+    schedule()                               // M goes to find another G
+}
+```
+
+The `unlockf` callback is critical — it lets the caller atomically release a lock (e.g., a channel's mutex) after the goroutine is committed to sleeping, preventing race conditions between "I decided to sleep" and "someone is trying to wake me."
+
+### The only reference is held by what the goroutine is waiting on
+
+Since the parked G isn't on any run queue or idle list, the **only pointer to it** exists on whatever synchronization object it's waiting on:
+
+| Waiting on | Where the reference lives | Via |
+|---|---|---|
+| Channel receive | `hchan.recvq` linked list | `sudog.g` |
+| Channel send | `hchan.sendq` linked list | `sudog.g` |
+| Mutex / Semaphore | `semaRoot` treap | `sudog.g` |
+| Network I/O | `pollDesc.rg` or `pollDesc.wg` | direct `*g` pointer |
+| Timer | timer heap | timer entry |
+| Select | one sudog per case, each on its channel's queue | `sudog.g` (all point to same G) |
+
+If hypothetically nothing held a reference, the GC could collect the goroutine. But this doesn't happen in practice because valid waits always store the reference.
+
+### The sudog — parking ticket for a goroutine
+
+A `sudog` ("pseudo-G") is a wrapper struct that links a goroutine to a synchronization object. Defined in `runtime/runtime2.go`:
+
+```go
+type sudog struct {
+    g        *g              // the waiting goroutine
+    next     *sudog          // next node in wait queue
+    prev     *sudog          // previous node in wait queue
+    elem     unsafe.Pointer  // pointer to the data being sent/received
+    isSelect bool            // true if part of a select statement
+    success  bool            // whether the channel op succeeded
+    parent   *sudog          // for semaRoot treap tree structure
+    waitlink *sudog          // links multiple sudogs for same G (select)
+    c        *hchan          // the channel this sudog is on
+}
+```
+
+Think of it as a parking ticket — it records which goroutine is parked, on which object, and where to put/get data.
+
+Sudogs are **pooled** to avoid GC pressure. `acquireSudog()` pulls from a per-P cache (`pp.sudogcache`), falling back to `sched.sudogcache`, falling back to `new(sudog)`. `releaseSudog()` returns them.
+
+### `_Gdead` free list vs `_Gwaiting` — completely different
+
+| | `_Gdead` (finished) | `_Gwaiting` (parked) |
+|---|---|---|
+| Meaning | Goroutine's function returned, it's done | Goroutine is alive, waiting for something |
+| Where it goes | `p.gFree` or `sched.gFree` free list | **Nowhere** — held only by wait object |
+| Purpose | Reused by `newproc()` for new goroutines | Will resume when woken by `goready()` |
+| Stack | May be freed/shrunk | Stays allocated |
+
+### How a parked goroutine becomes runnable again
+
+When the event happens (channel send, mutex unlock, data arrives on socket), the code triggering it calls `goready()`:
+
+```go
+func goready(gp *g, traceskip int) {
+    systemstack(func() {
+        ready(gp, traceskip, true)
+    })
+}
+
+func ready(gp *g, traceskip int, next bool) {
+    casgstatus(gp, _Gwaiting, _Grunnable)     // waiting → runnable
+    runqput(mp.p.ptr(), gp, next)              // put on CURRENT P's runnext
+    wakep()                                     // wake idle M if needed
+}
+```
+
+The woken goroutine goes into `runnext` of the **P that woke it** (not back to its original P). `runnext` means "run this next" — the scheduler checks it before the regular runq. This gives low-latency wakeup for communicating goroutine pairs.
+
+### gopark vs Gosched vs preemption — three different outcomes
+
+| | `gopark()` | `Gosched()` | `gopreempt_m()` (SIGURG) |
+|---|---|---|---|
+| New state | `_Gwaiting` | `_Grunnable` | `_Grunnable` |
+| Where G goes | **Nowhere** — held by wait object | Global run queue | Global run queue |
+| Who resumes it | Explicit `goready()` | Any P takes it from global queue | Any P takes it from global queue |
+| Use case | Channel, mutex, I/O, timer | Voluntary yield (`runtime.Gosched()`) | Scheduler preemption (>10ms) |
+
+---
+
+## Channel blocking — the complete picture
+
+### The `hchan` struct (every channel is one of these)
+
+When you write `make(chan int, 5)`, the runtime allocates:
+
+```go
+type hchan struct {
+    qcount   uint           // elements currently in the buffer
+    dataqsiz uint           // buffer capacity (0 = unbuffered)
+    buf      unsafe.Pointer // circular buffer array
+    elemsize uint16         // bytes per element
+    closed   uint32         // 0 = open, 1 = closed
+    sendx    uint           // next write position in buf
+    recvx    uint           // next read position in buf
+    recvq    waitq          // goroutines blocked on receive
+    sendq    waitq          // goroutines blocked on send
+    lock     mutex          // protects everything above
+}
+```
+
+| Field | What it is |
+|---|---|
+| `buf` | Circular ring buffer. For `make(chan int, 5)`, an array of 5 ints. For unbuffered, nil. |
+| `qcount` / `dataqsiz` | Current fill vs capacity. `qcount == dataqsiz` means buffer full. |
+| `sendx` / `recvx` | Write and read cursors in the circular buffer. |
+| `sendq` / `recvq` | Linked lists of `sudog` nodes — blocked senders/receivers. |
+| `lock` | Every channel operation acquires this first. |
+
+### Blocking on receive (`val := <-ch`)
+
+The runtime calls `chanrecv()`. Step by step when the channel is empty:
+
+```
+1. Lock the channel (c.lock)
+
+2. Check sendq — is anyone waiting to SEND?
+   YES → direct copy path (see below)
+   NO  → continue
+
+3. Check buffer — is qcount > 0?
+   YES → copy from buf[recvx], advance recvx, decrement qcount, unlock, done
+   NO  → continue
+
+4. Must block:
+   a. acquireSudog() — get a sudog from pool
+   b. Set sudog.g = current G, sudog.elem = &val (where to put received data)
+   c. Enqueue sudog onto c.recvq
+   d. gopark() — G goes _Grunning → _Gwaiting
+   e. M picks up next G via schedule()
+
+   ... goroutine is frozen here ...
+
+5. When a sender arrives later:
+   a. Sender dequeues this sudog from c.recvq
+   b. sendDirect() — copies value directly from sender's stack into &val
+      (bypasses the buffer entirely — memmove between two goroutines' stacks)
+   c. goready(receiver.g) — receiver goes to sender's P.runnext
+   d. Receiver resumes after gopark(), has the value in val
+```
+
+### Can a goroutine block on SEND? Yes.
+
+A goroutine blocks on `ch <- val` when:
+- The channel is **unbuffered** and no receiver is waiting, OR
+- The channel is **buffered but full** (`qcount == dataqsiz`)
+
+The flow mirrors receive:
+
+```
+1. Lock the channel
+
+2. PANIC CHECK: if c.closed == 1, panic("send on closed channel")
+
+3. Check recvq — is anyone waiting to RECEIVE?
+   YES → dequeue receiver's sudog, recvDirect() (copy val into receiver's stack),
+         goready(receiver.g), unlock, done
+   NO  → continue
+
+4. Check buffer — is qcount < dataqsiz?
+   YES → copy val into buf[sendx], advance sendx, increment qcount, unlock, done
+   NO  → continue (buffer full, or unbuffered)
+
+5. Must block:
+   a. acquireSudog()
+   b. Set sudog.g = current G, sudog.elem = &val (pointer to value being sent)
+   c. Enqueue sudog onto c.sendq
+   d. gopark() — G goes _Gwaiting
+
+   ... frozen until receiver arrives ...
+
+6. When a receiver dequeues this sudog:
+   a. Copies the data (from sender's stack or through buffer)
+   b. goready(sender.g) — sender goes to receiver's P.runnext
+```
+
+### Direct copy optimization
+
+When a sender finds a waiting receiver (or vice versa), the runtime uses `sendDirect()`/`recvDirect()` to `memmove` bytes directly between the two goroutines' stacks. This bypasses the buffer entirely — even on buffered channels when the buffer is empty and a receiver is already waiting.
+
+### Unbuffered vs buffered — flow comparison
+
+| Aspect | Unbuffered (`make(chan T)`) | Buffered (`make(chan T, N)`) |
+|---|---|---|
+| `dataqsiz` | 0 | N |
+| `buf` | Not used | Circular array of N elements |
+| Send with no receiver | Parks on `sendq` | Writes to `buf` if space; parks on `sendq` if full |
+| Receive with no sender | Parks on `recvq` | Reads from `buf` if data; parks on `recvq` if empty |
+| Direct copy | Always (sender↔receiver stacks) | Only when buffer empty + receiver waiting, or buffer full + sender waiting |
+| Synchronization | Sender and receiver must rendezvous | Decoupled up to N elements |
+
+### Select statement
+
+When a goroutine hits `select` with multiple cases:
+
+```go
+select {
+case v := <-ch1:
+case ch2 <- x:
+case <-ch3:
+}
+```
+
+The runtime calls `selectgo()` in three phases:
+
+**Phase 1 — Poll (optimistic).** Iterate all cases in **random order** (for fairness). Can any operation complete now? If yes, do it and return.
+
+**Phase 2 — Park on ALL channels.** If no case is ready:
+- Lock all channels in **memory-address order** (prevents deadlock when two goroutines select on the same channels in different order)
+- Create one `sudog` per case, each with `isSelect = true`
+- Enqueue each sudog onto its channel's `sendq` or `recvq`
+- Call `gopark()` — goroutine is now `_Gwaiting`, registered on multiple channels simultaneously
+
+**Phase 3 — Wake and cleanup.** When any one channel fires:
+- That channel dequeues the sudog, calls `goready()`
+- Goroutine wakes up, re-locks all channels
+- **Dequeues itself from every other channel's wait queue** (the ones that didn't fire)
+- Returns the index of the winning case
+
+### Closed channels
+
+| Operation | What happens |
+|---|---|
+| Receive from closed, buffer has data | Returns the buffered data normally |
+| Receive from closed, buffer empty | Returns zero value immediately, `ok = false` |
+| Send to closed | **Panics**: "send on closed channel" |
+| Close already-closed | **Panics**: "close of closed channel" |
+| Close nil channel | **Panics** |
+
+Inside `closechan()`: sets `c.closed = 1`, walks both `recvq` and `sendq`, calls `goready()` on every parked goroutine. Receivers get zero values. Senders will panic when they resume (they check `closed` after waking).
+
+---
+
+## Mutex — what it is and how it works
+
+### The concept from scratch
+
+A **mutex** (mutual exclusion) is a lock that ensures only one goroutine can access a shared resource at a time.
+
+**The problem without it:**
+```go
+// Two goroutines both doing counter++
+// counter++ is actually three steps: read, add 1, write back
+
+Goroutine A: read counter (0)
+Goroutine B: read counter (0)     ← both read 0
+Goroutine A: write counter (1)
+Goroutine B: write counter (1)    ← lost update! Should be 2, got 1
+```
+
+This is a **race condition**. A mutex prevents it: goroutine A locks, does its work, unlocks. Goroutine B waits until the lock is free.
+
+### `sync.Mutex` struct
+
+```go
+type Mutex struct {
+    state int32   // packs lock state + metadata in bits
+    sema  uint32  // runtime semaphore for parking/waking goroutines
+}
+```
+
+**`state` bit layout** (all packed into one int32):
+
+| Bits 31–3 | Bit 2 | Bit 1 | Bit 0 |
+|---|---|---|---|
+| Waiter count | Starving flag | Woken flag | Locked flag |
+
+**`sema`**: address passed to the runtime semaphore system. Goroutines sleep on it and get woken through it.
+
+### Lock() — fast path
+
+```go
+func (m *Mutex) Lock() {
+    if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+        return // grabbed unlocked mutex in one atomic instruction
+    }
+    m.lockSlow()
+}
+```
+
+If `state` is 0 (free), CAS sets it to 1 (locked). Done. This is the uncontended path — a single CPU instruction, extremely fast.
+
+### lockSlow() — when the mutex is held by someone else
+
+Three phases:
+
+**Phase 1: Spinning.** Before going to sleep (expensive — context switch), the goroutine busy-waits. `runtime_canSpin(iter)` returns true only when ALL hold:
+- `iter < 4` (at most 4 spin rounds)
+- Machine has more than 1 CPU core (spinning on single core is pointless)
+- At least one idle P exists
+- Mutex is NOT in starvation mode
+
+Each spin round calls `runtime_doSpin()` → executes x86 `PAUSE` instruction 30 times (`procyield(30)`). That's ~30 CPU cycles of "polite" busy-waiting. Total: up to 4 × 30 = 120 cycles.
+
+**Phase 2: Queue and sleep.** If spinning fails:
+1. Increment waiter count in `state` (bits 3+) via CAS
+2. Call `runtime_SemacquireMutex(&m.sema, queueLifo, 1)` — this parks the goroutine
+
+The goroutine gets wrapped in a **sudog** and placed on a **`semaRoot` treap** (a balanced tree data structure at the semaphore address). `goparkunlock()` removes it from the scheduler entirely. Zero CPU.
+
+**Phase 3: Waking up.** When woken by Unlock(), the goroutine checks how long it waited. If wait time exceeds **1 millisecond**, it sets the starving flag.
+
+### Normal mode vs starvation mode
+
+**Normal mode**: Waiters queue FIFO, but when a waiter wakes up it must **compete** with brand-new goroutines calling Lock(). New goroutines have an advantage — they're already running on a CPU. The woken waiter often loses.
+
+**Starvation mode** (triggered after 1ms wait): 
+- Mutex is **directly handed off** to the longest-waiting goroutine (front of queue)
+- New goroutines do NOT compete — they go straight to the back of the queue
+- No spinning is permitted
+
+Starvation mode exits when the woken goroutine is the last waiter, or it waited less than 1ms.
+
+### Unlock()
+
+```go
+func (m *Mutex) Unlock() {
+    new := atomic.AddInt32(&m.state, -mutexLocked)
+    if new != 0 {
+        m.unlockSlow(new)
+    }
+}
+```
+
+Fast path: subtract 1. If result is 0, nobody waiting — done.
+
+`unlockSlow` in normal mode: decrements waiter count, calls `runtime_Semrelease(&m.sema, false, 1)`. The `false` means no handoff — woken goroutine competes.
+
+`unlockSlow` in starvation mode: calls `runtime_Semrelease(&m.sema, true, 1)`. The `true` means **direct handoff** — semaphore ownership passes to the first waiter. Runtime even calls `goyield()` to immediately schedule that waiter.
+
+### Code example
+
+```go
+var (
+    mu      sync.Mutex
+    counter int
+)
+
+func increment(wg *sync.WaitGroup) {
+    defer wg.Done()
+    mu.Lock()
+    counter++       // only one goroutine at a time
+    mu.Unlock()
+}
+
+func main() {
+    var wg sync.WaitGroup
+    for i := 0; i < 1000; i++ {
+        wg.Add(1)
+        go increment(&wg)
+    }
+    wg.Wait()
+    fmt.Println(counter) // always 1000
+}
+```
+
+Without the mutex, `counter` would be some unpredictable number < 1000.
+
+---
+
+## sync.RWMutex — multiple readers OR one writer
+
+An RWMutex allows concurrent reads but exclusive writes. Ideal when reads vastly outnumber writes.
+
+### Struct
+
+```go
+type RWMutex struct {
+    w           Mutex        // held by writers (mutual exclusion between writers)
+    writerSem   uint32       // writers wait here for readers to finish
+    readerSem   uint32       // readers wait here when a writer is active
+    readerCount atomic.Int32 // active readers (can go negative!)
+    readerWait  atomic.Int32 // readers that must finish before writer proceeds
+}
+
+const rwmutexMaxReaders = 1 << 30  // ~1 billion
+```
+
+### RLock() (read lock)
+
+Atomically adds 1 to `readerCount`. If the result is **negative** (a writer is pending), the reader blocks on `readerSem`. If positive, proceeds immediately — a single atomic add, very fast.
+
+### RUnlock()
+
+Subtracts 1 from `readerCount`. If result is negative (writer waiting), decrements `readerWait`. When `readerWait` hits 0, the **last departing reader** releases `writerSem`, unblocking the writer.
+
+### Lock() (write lock)
+
+1. Acquires the internal `w` Mutex — serializes writers against each other
+2. Subtracts `rwmutexMaxReaders` from `readerCount`, making it deeply negative — signals all future readers "a writer is pending, block"
+3. Sets `readerWait` to the count of currently-active readers
+4. Sleeps on `writerSem` until the last active reader releases it
+
+### Unlock() (write unlock)
+
+1. Adds `rwmutexMaxReaders` back to `readerCount` — readers can proceed again
+2. Releases `readerSem` once per blocked reader, waking them all
+3. Releases internal `w` Mutex
+
+**Writer priority**: Once a writer calls Lock(), all subsequent RLock() calls block. Only already-active readers complete. This prevents writer starvation.
+
+### Code example
+
+```go
+var (
+    rwmu  sync.RWMutex
+    cache = make(map[string]string)
+)
+
+func get(key string) (string, bool) {
+    rwmu.RLock()         // multiple readers simultaneously
+    defer rwmu.RUnlock()
+    v, ok := cache[key]
+    return v, ok
+}
+
+func set(key, value string) {
+    rwmu.Lock()          // exclusive access
+    defer rwmu.Unlock()
+    cache[key] = value
+}
+```
+
+---
+
+## The semaphore underneath it all
+
+Source: `runtime/sema.go`
+
+Every blocking sync primitive (Mutex, RWMutex, WaitGroup, Once, Cond) ultimately parks goroutines through the runtime's semaphore system.
+
+### `semTable` — the global parking lot
+
+A global array of **251** `semaRoot` entries (251 is prime to reduce hash collisions). When a goroutine sleeps on `&m.sema`, the address is hashed: `semtable[(address >> 3) % 251].root`.
+
+### `semaRoot` — a treap of waiters
+
+Each `semaRoot` contains a **treap** (tree + heap hybrid):
+- Binary search tree keyed by semaphore address (O(log n) lookup)
+- Heap-ordered by random `ticket` field (probabilistic balance)
+- Multiple goroutines waiting on the **same address** form a linked list via `waitlink`/`waittail` — O(1) enqueue/dequeue
+
+### Parking (`semacquire1`)
+
+1. Try `cansemacquire(addr)` — atomically decrement `*addr` if > 0. If yes, return immediately (uncontended fast path)
+2. Allocate a `sudog`, record goroutine and address
+3. Lock the semaRoot, enqueue sudog into treap
+4. `goparkunlock()` — release lock and park goroutine atomically
+
+### Waking (`semrelease1`)
+
+1. Atomically increment `*addr`
+2. If no waiters, done
+3. Lock semaRoot, dequeue first sudog for this address
+4. If `handoff == true` (starvation mode): re-decrement `*addr`, set `sudog.ticket = 1` (proof of ownership), call `goyield()` to immediately schedule the waiter
+5. If `handoff == false` (normal): call `goready()` — waiter goes to P's runnext, competes normally
+
+---
+
+## sync.WaitGroup — waiting for N goroutines
+
+### The concept
+
+You launch N goroutines and need to wait until all N finish.
+
+### Struct
+
+```go
+type WaitGroup struct {
+    noCopy noCopy
+    state  atomic.Uint64   // bits 32-63: counter, bits 0-31: waiter count
+    sema   uint32          // runtime semaphore
+}
+```
+
+The `uint64` packs two 32-bit values — the **task counter** and the **waiter count**. Packing lets both be updated atomically.
+
+### Operations
+
+**`Add(delta)`**: Atomically adds `delta` to the counter bits. If counter goes negative → panic. If counter reaches 0 and there are waiters → calls `runtime_Semrelease(&wg.sema)` in a loop, once per waiter, waking every parked goroutine.
+
+**`Done()`**: Just `Add(-1)`. Nothing more.
+
+**`Wait()`**: If counter is 0, returns immediately. Otherwise increments waiter count via CAS, then calls `runtime_SemacquireWaitGroup(&wg.sema)` which **parks the goroutine** until the semaphore is released (when counter hits 0).
+
+### Code example
+
+```go
+var wg sync.WaitGroup
+for i := 0; i < 5; i++ {
+    wg.Add(1)
+    go func(id int) {
+        defer wg.Done()
+        fmt.Println("worker", id, "done")
+    }(i)
+}
+wg.Wait() // blocks until counter hits 0
+```
+
+**Common mistakes:**
+- `Add()` after `Wait()` started → panic
+- `Done()` more times than `Add()` → negative counter panic
+- Go 1.25 added `wg.Go(f)` which combines `Add(1)` + goroutine launch + `defer Done()` in one call
+
+---
+
+## All other Go concurrency primitives
+
+### sync.Once — run something exactly once
+
+```go
+type Once struct {
+    done atomic.Bool   // fast path: checked without locking
+    m    Mutex         // slow path: serializes first execution
+}
+```
+
+**Fast path**: `Do(f)` does `if !o.done.Load() { o.doSlow(f) }`. After the function runs once, every subsequent call is a single atomic load — instant.
+
+**Slow path**: `doSlow` locks the mutex, checks `done` again (double-check pattern — another goroutine may have completed it while we waited for the lock), runs `f()`, then sets `done = true`.
+
+Why not just CAS without a mutex? Because `Do` guarantees it does not return until `f()` has **completed**. CAS-only would let competing goroutines return before `f` finishes.
+
+```go
+var once sync.Once
+var db *Database
+
+func GetDB() *Database {
+    once.Do(func() {
+        db = connectToDatabase() // runs exactly once
+    })
+    return db
+}
+```
+
+Go 1.21 added `sync.OnceFunc`, `sync.OnceValue[T]`, `sync.OnceValues[T1, T2]` — generic wrappers.
+
+### sync.Cond — condition variable
+
+**Concept from scratch**: A condition variable lets goroutines wait until some shared condition becomes true, without busy-looping. It's always paired with a mutex that protects the shared state being checked.
+
+Three operations:
+- **`Wait()`**: Atomically unlocks the mutex and parks the goroutine. When woken, re-locks the mutex before returning.
+- **`Signal()`**: Wakes exactly one waiting goroutine.
+- **`Broadcast()`**: Wakes ALL waiting goroutines.
+
+**Why Wait() must be in a loop**: Another goroutine may have consumed the condition between Signal/Broadcast and when your goroutine re-acquires the lock.
+
+```go
+cond.L.Lock()
+for !condition {    // MUST be a loop, not if
+    cond.Wait()
+}
+// condition is true, proceed
+cond.L.Unlock()
+```
+
+**When to use vs channels**: Use Cond when you need to wake multiple waiters about state changes without transferring data (especially `Broadcast`). Channels are better for passing values or fan-out/fan-in.
+
+```go
+mu := sync.Mutex{}
+cond := sync.NewCond(&mu)
+buf := make([]int, 0, 10)
+
+// Producer
+go func() {
+    for i := 0; ; i++ {
+        cond.L.Lock()
+        for len(buf) == cap(buf) { cond.Wait() }
+        buf = append(buf, i)
+        cond.Signal()
+        cond.L.Unlock()
+    }
+}()
+
+// Consumer
+go func() {
+    for {
+        cond.L.Lock()
+        for len(buf) == 0 { cond.Wait() }
+        item := buf[0]; buf = buf[1:]
+        cond.Signal()
+        cond.L.Unlock()
+        process(item)
+    }
+}()
+```
+
+### sync.Pool — temporary object cache
+
+A cache of reusable objects to reduce GC pressure. `Put` returns objects, `Get` retrieves (or calls `New`).
+
+**NOT a connection pool** — the GC can evict objects at any time. Internally uses per-P local caches for lock-free access.
+
+```go
+var bufPool = sync.Pool{
+    New: func() any { return make([]byte, 0, 4096) },
+}
+
+func process(data []byte) {
+    buf := bufPool.Get().([]byte)
+    buf = buf[:0]
+    // ... use buf ...
+    bufPool.Put(buf)
+}
+```
+
+### sync.Map — concurrent map for specific patterns
+
+Optimized for exactly two patterns:
+1. Write-once-read-many (keys set once, read frequently)
+2. Disjoint key sets (goroutines touch different keys)
+
+For anything else (especially write-heavy), use `map` + `sync.RWMutex`.
+
+Internally keeps two maps: a lock-free **read** map (atomic pointer) and a mutex-protected **dirty** map. Reads hit the atomic read map first; on miss, locks and checks dirty. After enough misses, dirty is promoted to become the new read map.
+
+### sync/atomic — CPU-level indivisible operations
+
+**What atomic means**: A normal `counter++` is three CPU steps (load, add, store). Two goroutines doing this simultaneously can interleave. An atomic operation is a single, indivisible CPU instruction — hardware guarantees no other core can interfere mid-operation.
+
+**Typed wrappers** (Go 1.19+): `atomic.Int32`, `atomic.Int64`, `atomic.Uint64`, `atomic.Bool`, `atomic.Pointer[T]`. Methods: `Load()`, `Store()`, `Add()`, `Swap()`, `CompareAndSwap()`.
+
+**CompareAndSwap (CAS)**: "If current value == old, replace with new, return true. Otherwise do nothing, return false." Maps to x86 `CMPXCHG` instruction. This is the building block for lock-free data structures — it's what Mutex's fast path uses.
+
+**When to use atomic vs mutex**: Atomic for single variables (counters, flags). Mutex when you need to protect multiple related variables together.
+
+### context.Context — cancellation and timeouts
+
+**Problem**: You launch goroutines for a request, but the client disconnects. How do you tell all spawned goroutines to stop?
+
+Contexts form a **tree** — when a parent is cancelled, all children are automatically cancelled.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+
+go func() {
+    select {
+    case <-ctx.Done():
+        fmt.Println("cancelled:", ctx.Err()) // context.DeadlineExceeded
+        return
+    case result := <-doWork():
+        fmt.Println("result:", result)
+    }
+}()
+```
+
+- `context.WithCancel(parent)` — manual cancel via returned function
+- `context.WithTimeout(parent, duration)` — auto-cancels after duration
+- `context.WithDeadline(parent, time)` — auto-cancels at absolute time
+- `context.WithValue(parent, key, val)` — attaches request-scoped data (use sparingly)
+
+### Complete inventory
+
+**Language primitives**: goroutines (`go`), channels (`chan`), `select`
+
+**`sync` package**: Mutex, RWMutex, WaitGroup, Once (+ OnceFunc/OnceValue/OnceValues), Cond, Pool, Map, Locker (interface)
+
+**`sync/atomic`**: Int32, Int64, Uint32, Uint64, Bool, Pointer[T], Value
+
+**Standard library**: `context` package
+
+**Extended library (`golang.org/x/sync`)** — not in stdlib but officially maintained:
+- **errgroup** — WaitGroup that collects the first error
+- **semaphore** — weighted semaphore (bounded concurrency)
+- **singleflight** — deduplicates concurrent calls to the same function/key
+
+That is the complete set.
+
+---
+
+### Part 3 Sources
+
+- [`runtime/chan.go`](https://github.com/golang/go/blob/master/src/runtime/chan.go) — `hchan`, `chansend`, `chanrecv`, `closechan`
+- [`runtime/select.go`](https://go.dev/src/runtime/select.go) — `selectgo`, multi-sudog allocation
+- [`runtime/runtime2.go`](https://github.com/golang/go/blob/master/src/runtime/runtime2.go) — `sudog` struct, `g` struct, state constants
+- [`runtime/proc.go`](https://github.com/golang/go/blob/master/src/runtime/proc.go) — `gopark`, `park_m`, `goready`, `ready`, `goschedImpl`, `gopreempt_m`
+- [`runtime/sema.go`](https://github.com/golang/go/blob/master/src/runtime/sema.go) — `semaRoot`, `semacquire1`, `semrelease1`, treap
+- [`sync/mutex.go`](https://github.com/golang/go/blob/master/src/sync/mutex.go) — `Mutex`, `Lock`, `lockSlow`, normal/starvation modes
+- [`sync/rwmutex.go`](https://github.com/golang/go/blob/master/src/sync/rwmutex.go) — `RWMutex`, `readerCount` negative trick
+- [`sync/waitgroup.go`](https://go.dev/src/sync/waitgroup.go) — `WaitGroup`, packed state
+- [`sync/once.go`](https://go.dev/src/sync/once.go) — `Once`, fast/slow path
+- [`sync/cond.go`](https://go.dev/src/sync/cond.go) — `Cond`, `Wait`, `Signal`, `Broadcast`
+- [`sync/pool.go`](https://go.dev/src/sync/pool.go) — per-P cache, victim cache
+- [`sync/map.go`](https://go.dev/src/sync/map.go) — read/dirty map split
+- [Go Channels: A Runtime Internals Deep Dive](https://dev.to/gkoos/go-channels-a-runtime-internals-deep-dive-36d8)
+- [VictoriaMetrics: Go sync.Mutex Normal and Starvation Mode](https://victoriametrics.com/blog/go-sync-mutex/)
+- [VictoriaMetrics: Go sync.Cond](https://victoriametrics.com/blog/go-sync-cond/)
+- [Goroutine Parking Logic in Go](https://medium.com/@AlexanderObregon/goroutine-parking-logic-in-go-5d533e9e67fd)
+- [Go runtime HACKING guide](https://go.dev/src/runtime/HACKING)
 - [golang/go#14592](https://github.com/golang/go/issues/14592) — "let idle OS threads exit" (open, not implemented)
 - [golang/go#20395](https://github.com/golang/go/issues/20395) — LockOSThread thread termination design
