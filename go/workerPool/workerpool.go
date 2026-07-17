@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"sync"
 )
 
@@ -35,7 +34,7 @@ func NewWorkerPool(workerCount int) *Pool {
 			defer pool.wg.Done()
 			// wait for a job to come
 			for job := range pool.workerQueue {
-				fmt.Printf("%dth Worker doing job\n", id)
+				//	fmt.Printf("%dth Worker doing job\n", id)
 				job.Do()
 			}
 		}(i)

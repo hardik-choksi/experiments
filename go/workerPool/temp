@@ -1,0 +1,3 @@
+gc 1 @21.621s 0%: 0.20+0.87+0.13 ms clock, 2.4+0.21/1.3/0+1.5 ms cpu, 3->3->0 MB, 4 MB goal, 0 MB stacks, 0 MB globals, 12 P
+hardik
+hardik gc`
