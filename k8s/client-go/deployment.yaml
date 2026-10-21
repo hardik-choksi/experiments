@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: data-getter
+  name: data-getter
+  namespace: loki
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-getter
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: data-getter
+    spec:
+      serviceAccountName: data-getter
+      containers:
+      - image: hardikchoksi/data-getter:beta0
+        name: data-getter
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "120Mi"
+status: {}
